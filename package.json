@@ -1,0 +1,22 @@
+{
+  "name": "barberbot",
+  "version": "1.0.0",
+  "description": "WhatsApp AI bot for barbershop appointments",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "@supabase/supabase-js": "^2.49.0",
+    "express": "^4.18.2",
+    "twilio": "^5.3.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
