@@ -1,6 +1,6 @@
 {
   "name": "barberbot",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "WhatsApp AI bot for barbershop appointments",
   "main": "index.js",
   "scripts": {
