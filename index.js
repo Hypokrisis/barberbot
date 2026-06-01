@@ -1,3 +1,8 @@
+// Polyfill WebSocket for Node.js < 22 (required by Supabase realtime)
+if (!globalThis.WebSocket) {
+  globalThis.WebSocket = require('ws');
+}
+
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const twilio = require('twilio');
