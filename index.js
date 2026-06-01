@@ -58,20 +58,17 @@ async function getBusinessInfo(businessId) {
 }
 
 async function getAvailableSlots(barberId, date) {
-  // Get barber schedule for day of week
-  const d = new Date(date);
-  const dow = d.getDay();
+  const dow = new Date(date + 'T12:00:00').getDay();
   const { data: schedule } = await supabase
     .from('schedules')
     .select('start_time,end_time')
     .eq('barber_id', barberId)
     .eq('day_of_week', dow)
     .eq('is_active', true)
-    .single();
+    .maybeSingle();
 
   if (!schedule) return [];
 
-  // Get existing appointments
   const { data: appointments } = await supabase
     .from('appointments')
     .select('start_time,end_time')
@@ -79,7 +76,6 @@ async function getAvailableSlots(barberId, date) {
     .eq('appointment_date', date)
     .neq('status', 'cancelled');
 
-  // Generate 30-min slots
   const slots = [];
   let [sh, sm] = schedule.start_time.split(':').map(Number);
   const [eh, em] = schedule.end_time.split(':').map(Number);
@@ -87,17 +83,30 @@ async function getAvailableSlots(barberId, date) {
 
   while (sh * 60 + sm + 30 <= endMins) {
     const slotStart = `${String(sh).padStart(2,'0')}:${String(sm).padStart(2,'0')}`;
-    const nextSm = sm + 30;
-    const nextSh = sh + Math.floor(nextSm / 60);
-    const slotEnd = `${String(nextSh).padStart(2,'0')}:${String(nextSm % 60).padStart(2,'0')}`;
-
     const busy = appointments?.some(a => a.start_time.slice(0,5) === slotStart);
     if (!busy) slots.push(slotStart);
-
     sm += 30;
     if (sm >= 60) { sh++; sm -= 60; }
   }
   return slots;
+}
+
+async function getNextAvailableDays(barberId, count = 5) {
+  const results = [];
+  const today = new Date();
+  let offset = 1;
+
+  while (results.length < count && offset <= 30) {
+    const d = new Date(today);
+    d.setDate(today.getDate() + offset);
+    const dateStr = d.toISOString().split('T')[0];
+    const slots = await getAvailableSlots(barberId, dateStr);
+    if (slots.length > 0) {
+      results.push({ date: dateStr, day: dayName(d.getDay()), slots: slots.slice(0, 3) });
+    }
+    offset++;
+  }
+  return results;
 }
 
 async function createAppointment(data) {
@@ -127,48 +136,29 @@ async function sendWhatsApp(to, body) {
   });
 }
 
-async function sendConfirmationTemplate(to, params) {
-  // Use the approved appointment_confirmation template
-  await twilioClient.messages.create({
-    from: process.env.TWILIO_WHATSAPP_FROM,
-    to: `whatsapp:${to}`,
-    contentSid: process.env.TEMPLATE_CONFIRMATION_SID,
-    contentVariables: JSON.stringify(params)
-  });
-}
-
 // ── AI conversation handler ───────────────────────────────────────────────────
 async function handleMessage(phone, message, businessId) {
   const session = getSession(phone);
   const { business, barbers, services } = await getBusinessInfo(businessId);
 
-  const systemPrompt = `Eres el asistente virtual de ${business.name}, una barbería en ${business.city}, Puerto Rico.
-Tu trabajo es ayudar a los clientes a hacer citas por WhatsApp.
+  const systemPrompt = `Eres el asistente de ${business.name} en ${business.city}, PR. Ayudas a agendar citas por WhatsApp. Sé breve y directo.
 
-Barberos disponibles:
-${barbers.map(b => `- ${b.name} (ID: ${b.id})`).join('\n')}
+Barberos: ${barbers.map(b => `${b.name} (ID:${b.id})`).join(', ')}
+Servicios: ${services.map(s => `${s.name} $${s.price} ${s.duration_minutes}min (ID:${s.id})`).join(', ')}
+Estado: ${JSON.stringify(session.data)}
 
-Servicios disponibles:
-${services.map(s => `- ${s.name}: $${s.price}, ${s.duration_minutes} min (ID: ${s.id})`).join('\n')}
+Flujo: nombre → servicio → barbero → fecha → horario → confirmar.
 
-Flujo para hacer una cita:
-1. Pregunta el nombre del cliente
-2. Pregunta qué servicio quiere
-3. Pregunta qué barbero prefiere (o dice "cualquiera")
-4. Pregunta la fecha deseada (formato YYYY-MM-DD)
-5. Muestra los horarios disponibles y pregunta cuál prefiere
-6. Confirma todos los datos y crea la cita
+Cuando el cliente pregunte qué fechas o días hay disponibles, responde SOLO con este JSON:
+{"action":"get_dates","barberId":"ID_DEL_BARBERO"}
 
-Estado actual de la conversación:
-${JSON.stringify(session.data)}
+Cuando tengas fecha y quiera ver horarios, responde SOLO con este JSON:
+{"action":"get_slots","barberId":"ID","date":"YYYY-MM-DD"}
 
-Cuando tengas todos los datos necesarios para crear la cita, responde EXACTAMENTE con este JSON (sin texto extra):
-{"action":"create_appointment","customerName":"...","serviceId":"...","barberId":"...","date":"YYYY-MM-DD","startTime":"HH:MM"}
+Cuando tengas todos los datos, responde SOLO con este JSON:
+{"action":"create_appointment","customerName":"...","serviceId":"ID","barberId":"ID","date":"YYYY-MM-DD","startTime":"HH:MM"}
 
-Si el cliente quiere ver horarios disponibles, responde con:
-{"action":"get_slots","barberId":"...","date":"YYYY-MM-DD"}
-
-Para todo lo demás, responde normalmente en español de manera amigable y concisa.`;
+IMPORTANTE: cuando respondas con JSON, escribe ÚNICAMENTE el JSON, sin texto antes ni después.`;
 
   session.history.push({ role: 'user', content: message });
 
@@ -178,26 +168,40 @@ Para todo lo demás, responde normalmente en español de manera amigable y conci
       { role: 'system', content: systemPrompt },
       ...session.history
     ],
-    temperature: 0.7,
-    max_tokens: 500
+    temperature: 0.4,
+    max_tokens: 300
   });
 
-  const responseText = completion.choices[0].message.content;
+  const responseText = completion.choices[0].message.content.trim();
 
-  // Check if AI returned an action
-  try {
-    const trimmed = responseText.trim();
-    if (trimmed.startsWith('{')) {
-      const action = JSON.parse(trimmed);
+  // Extract JSON from response (handles cases where model wraps it in text/markdown)
+  const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+  if (jsonMatch) {
+    try {
+      const action = JSON.parse(jsonMatch[0]);
+
+      if (action.action === 'get_dates') {
+        const barberId = action.barberId;
+        const days = await getNextAvailableDays(barberId, 5);
+        if (days.length === 0) {
+          const reply = `No hay fechas disponibles en los próximos 30 días. Contáctanos directamente.`;
+          session.history.push({ role: 'assistant', content: reply });
+          return reply;
+        }
+        const lines = days.map(d => `📅 ${d.day} ${d.date}: ${d.slots.join(', ')}...`);
+        const reply = `Próximas fechas disponibles:\n${lines.join('\n')}\n\n¿Cuál prefieres?`;
+        session.history.push({ role: 'assistant', content: reply });
+        return reply;
+      }
 
       if (action.action === 'get_slots') {
         const slots = await getAvailableSlots(action.barberId, action.date);
         if (slots.length === 0) {
-          const reply = `No hay horarios disponibles para esa fecha. ¿Quieres probar con otra fecha?`;
+          const reply = `No hay horarios para el ${action.date}. ¿Otra fecha?`;
           session.history.push({ role: 'assistant', content: reply });
           return reply;
         }
-        const reply = `Horarios disponibles para el ${action.date}:\n${slots.map((s,i) => `${i+1}. ${s}`).join('\n')}\n\n¿Cuál prefieres?`;
+        const reply = `Horarios del ${action.date}:\n${slots.map((s,i) => `${i+1}. ${s}`).join('\n')}\n\n¿Cuál prefieres?`;
         session.data.availableSlots = slots;
         session.data.selectedDate = action.date;
         session.data.selectedBarberId = action.barberId;
@@ -206,7 +210,6 @@ Para todo lo demás, responde normalmente en español de manera amigable y conci
       }
 
       if (action.action === 'create_appointment') {
-        // Calculate end time based on service duration
         const service = services.find(s => s.id === action.serviceId);
         const [h, m] = action.startTime.split(':').map(Number);
         const endMin = h * 60 + m + (service?.duration_minutes || 30);
@@ -224,21 +227,22 @@ Para todo lo demás, responde normalmente en español de manera amigable y conci
         });
 
         if (error) {
-          const reply = `Hubo un error al crear la cita. Por favor intenta de nuevo.`;
+          const reply = `Error al crear la cita. Intenta de nuevo.`;
           session.history.push({ role: 'assistant', content: reply });
           return reply;
         }
 
-        // Reset session
         sessions[phone] = { history: [], state: 'idle', data: {} };
 
         const barber = barbers.find(b => b.id === action.barberId);
-        const reply = `✅ ¡Cita confirmada!\n\n👤 ${action.customerName}\n✂️ ${service?.name}\n💈 Barbero: ${barber?.name}\n📅 ${action.date}\n⏰ ${action.startTime}\n\n¡Te esperamos en ${business.name}!`;
+        const bookingLink = business.whatsapp_booking_link || business.website_url || '';
+        const linkLine = bookingLink ? `\n🔗 ${bookingLink}` : '';
+        const reply = `✅ ¡Cita confirmada!\n\n👤 ${action.customerName}\n✂️ ${service?.name}\n💈 ${barber?.name}\n📅 ${action.date} ${action.startTime}${linkLine}\n\n¡Te esperamos!`;
         return reply;
       }
+    } catch (e) {
+      // JSON parse failed, fall through to normal response
     }
-  } catch (e) {
-    // Not a JSON action, normal response
   }
 
   session.history.push({ role: 'assistant', content: responseText });
@@ -250,10 +254,12 @@ app.post('/webhook', async (req, res) => {
   const { Body, From } = req.body;
   const phone = From.replace('whatsapp:', '');
 
+  // Respond immediately to Twilio to prevent retries and double messages
+  res.status(200).end();
+
   console.log(`Message from ${phone}: ${Body}`);
 
   try {
-    // Get business from twilio settings
     const { data: twilioSettings, error: settingsError } = await supabase
       .from('twilio_settings')
       .select('business_id')
@@ -264,17 +270,15 @@ app.post('/webhook', async (req, res) => {
     if (settingsError || !twilioSettings) {
       console.error('Twilio settings error:', settingsError);
       await sendWhatsApp(phone, 'Servicio no disponible en este momento.');
-      return res.sendStatus(200);
+      return;
     }
 
     const reply = await handleMessage(phone, Body, twilioSettings.business_id);
     await sendWhatsApp(phone, reply);
   } catch (err) {
     console.error('Error:', err);
-    await sendWhatsApp(phone, 'Ocurrió un error. Por favor intenta de nuevo.');
+    await sendWhatsApp(phone, 'Ocurrió un error. Intenta de nuevo.');
   }
-
-  res.sendStatus(200);
 });
 
 app.get('/health', (_, res) => res.json({ status: 'ok' }));
