@@ -2,7 +2,6 @@ const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const twilio = require('twilio');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-const WebSocket = require('ws');
 
 // ── Environment validation ───────────────────────────────────────────────────
 const requiredEnvVars = [
@@ -26,9 +25,7 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 // ── Clients ──────────────────────────────────────────────────────────────────
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, {
-  realtime: { transport: WebSocket }
-});
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
