@@ -36,10 +36,18 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 // ── In-memory conversation state ─────────────────────────────────────────────
 const sessions = {};
+const SESSION_TTL = 30 * 60 * 1000; // 30 minutes
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function getSession(phone) {
-  if (!sessions[phone]) sessions[phone] = { history: [], state: 'idle', data: {} };
+  const now = Date.now();
+  if (sessions[phone] && now - sessions[phone].lastActivity > SESSION_TTL) {
+    delete sessions[phone];
+  }
+  if (!sessions[phone]) {
+    sessions[phone] = { history: [], state: 'idle', data: {}, lastActivity: now };
+  }
+  sessions[phone].lastActivity = now;
   return sessions[phone];
 }
 
@@ -137,28 +145,39 @@ async function sendWhatsApp(to, body) {
 }
 
 // ── AI conversation handler ───────────────────────────────────────────────────
+const GREETINGS = new Set(['hola','hi','hello','info','información','informacion','buenas','hey','ola','buen dia','buenos dias','buenas tardes','buenas noches']);
+
 async function handleMessage(phone, message, businessId) {
   const session = getSession(phone);
   const { business, barbers, services } = await getBusinessInfo(businessId);
 
-  const systemPrompt = `Eres el asistente de ${business.name} en ${business.city}, PR. Ayudas a agendar citas por WhatsApp. Sé breve y directo.
+  // Quick reply for greetings/info — 1 message with everything
+  if (GREETINGS.has(message.toLowerCase().trim())) {
+    const bookingLink = business.whatsapp_booking_link || business.website_url || '';
+    const svcList = services.map(s => `• ${s.name}: $${s.price}`).join('\n');
+    const link = bookingLink ? `\n🔗 Reserva: ${bookingLink}` : '';
+    return `¡Hola! Soy el asistente de *${business.name}* 💈\n\n*Servicios:*\n${svcList}${link}\n\n¿En qué te puedo ayudar?`;
+  }
 
-Barberos: ${barbers.map(b => `${b.name} (ID:${b.id})`).join(', ')}
-Servicios: ${services.map(s => `${s.name} $${s.price} ${s.duration_minutes}min (ID:${s.id})`).join(', ')}
+  const systemPrompt = `Eres el asistente de ${business.name}, ${business.city} PR. Agendas citas por WhatsApp.
+Responde en máximo 3 líneas. Un solo mensaje, sin listas largas.
+
+Barberos: ${barbers.map(b => `${b.name}(ID:${b.id})`).join(', ')}
+Servicios: ${services.map(s => `${s.name} $${s.price}(ID:${s.id})`).join(', ')}
 Estado: ${JSON.stringify(session.data)}
 
-Flujo: nombre → servicio → barbero → fecha → horario → confirmar.
+Flujo: nombre→servicio→barbero→fecha→horario→confirmar.
 
-Cuando el cliente pregunte qué fechas o días hay disponibles, responde SOLO con este JSON:
-{"action":"get_dates","barberId":"ID_DEL_BARBERO"}
+Si piden fechas/disponibilidad responde SOLO este JSON:
+{"action":"get_dates","barberId":"ID"}
 
-Cuando tengas fecha y quiera ver horarios, responde SOLO con este JSON:
+Si tienen fecha y quieren horarios responde SOLO este JSON:
 {"action":"get_slots","barberId":"ID","date":"YYYY-MM-DD"}
 
-Cuando tengas todos los datos, responde SOLO con este JSON:
+Si tienes todos los datos responde SOLO este JSON:
 {"action":"create_appointment","customerName":"...","serviceId":"ID","barberId":"ID","date":"YYYY-MM-DD","startTime":"HH:MM"}
 
-IMPORTANTE: cuando respondas con JSON, escribe ÚNICAMENTE el JSON, sin texto antes ni después.`;
+Cuando uses JSON: SOLO el JSON, sin texto extra.`;
 
   session.history.push({ role: 'user', content: message });
 
@@ -166,10 +185,10 @@ IMPORTANTE: cuando respondas con JSON, escribe ÚNICAMENTE el JSON, sin texto an
     model: 'llama-3.1-8b-instant',
     messages: [
       { role: 'system', content: systemPrompt },
-      ...session.history
+      ...session.history.slice(-10)  // last 10 messages only
     ],
-    temperature: 0.4,
-    max_tokens: 300
+    temperature: 0.3,
+    max_tokens: 200
   });
 
   const responseText = completion.choices[0].message.content.trim();
