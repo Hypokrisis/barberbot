@@ -174,7 +174,7 @@ Para todo lo demás, responde normalmente en español de manera amigable y conci
   session.history.push({ role: 'user', parts: [{ text: message }] });
 
   const model = genAI.getGenerativeModel({
-    model: 'gemini-1.5-flash',
+    model: 'gemini-2.0-flash',
     systemInstruction: systemPrompt
   });
   const chat = model.startChat({
