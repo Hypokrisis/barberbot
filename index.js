@@ -173,10 +173,12 @@ Para todo lo demás, responde normalmente en español de manera amigable y conci
   // Add message to history
   session.history.push({ role: 'user', parts: [{ text: message }] });
 
-  const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-  const chat = model.startChat({
-    history: session.history.slice(0, -1),
+  const model = genAI.getGenerativeModel({
+    model: 'gemini-1.5-flash',
     systemInstruction: systemPrompt
+  });
+  const chat = model.startChat({
+    history: session.history.slice(0, -1)
   });
 
   const result = await chat.sendMessage(message);
