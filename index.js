@@ -6,7 +6,7 @@ if (!globalThis.WebSocket) {
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const twilio = require('twilio');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const Groq = require('groq-sdk');
 
 // ── Environment validation ───────────────────────────────────────────────────
 const requiredEnvVars = [
@@ -15,7 +15,7 @@ const requiredEnvVars = [
   'TWILIO_ACCOUNT_SID',
   'TWILIO_AUTH_TOKEN',
   'TWILIO_WHATSAPP_FROM',
-  'GEMINI_API_KEY'
+  'GROQ_API_KEY'
 ];
 
 const missingEnvVars = requiredEnvVars.filter(v => !process.env[v]);
@@ -32,7 +32,7 @@ app.use(express.json());
 // ── Clients ──────────────────────────────────────────────────────────────────
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 // ── In-memory conversation state ─────────────────────────────────────────────
 const sessions = {};
@@ -170,19 +170,19 @@ Si el cliente quiere ver horarios disponibles, responde con:
 
 Para todo lo demás, responde normalmente en español de manera amigable y concisa.`;
 
-  // Add message to history
-  session.history.push({ role: 'user', parts: [{ text: message }] });
+  session.history.push({ role: 'user', content: message });
 
-  const model = genAI.getGenerativeModel({
-    model: 'gemini-1.5-flash-latest',
-    systemInstruction: systemPrompt
-  });
-  const chat = model.startChat({
-    history: session.history.slice(0, -1)
+  const completion = await groq.chat.completions.create({
+    model: 'llama-3.1-8b-instant',
+    messages: [
+      { role: 'system', content: systemPrompt },
+      ...session.history
+    ],
+    temperature: 0.7,
+    max_tokens: 500
   });
 
-  const result = await chat.sendMessage(message);
-  const responseText = result.response.text();
+  const responseText = completion.choices[0].message.content;
 
   // Check if AI returned an action
   try {
@@ -194,14 +194,14 @@ Para todo lo demás, responde normalmente en español de manera amigable y conci
         const slots = await getAvailableSlots(action.barberId, action.date);
         if (slots.length === 0) {
           const reply = `No hay horarios disponibles para esa fecha. ¿Quieres probar con otra fecha?`;
-          session.history.push({ role: 'model', parts: [{ text: reply }] });
+          session.history.push({ role: 'assistant', content: reply });
           return reply;
         }
         const reply = `Horarios disponibles para el ${action.date}:\n${slots.map((s,i) => `${i+1}. ${s}`).join('\n')}\n\n¿Cuál prefieres?`;
         session.data.availableSlots = slots;
         session.data.selectedDate = action.date;
         session.data.selectedBarberId = action.barberId;
-        session.history.push({ role: 'model', parts: [{ text: reply }] });
+        session.history.push({ role: 'assistant', content: reply });
         return reply;
       }
 
@@ -225,7 +225,7 @@ Para todo lo demás, responde normalmente en español de manera amigable y conci
 
         if (error) {
           const reply = `Hubo un error al crear la cita. Por favor intenta de nuevo.`;
-          session.history.push({ role: 'model', parts: [{ text: reply }] });
+          session.history.push({ role: 'assistant', content: reply });
           return reply;
         }
 
@@ -241,7 +241,7 @@ Para todo lo demás, responde normalmente en español de manera amigable y conci
     // Not a JSON action, normal response
   }
 
-  session.history.push({ role: 'model', parts: [{ text: responseText }] });
+  session.history.push({ role: 'assistant', content: responseText });
   return responseText;
 }
 
