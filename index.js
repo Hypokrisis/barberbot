@@ -3,6 +3,23 @@ const { createClient } = require('@supabase/supabase-js');
 const twilio = require('twilio');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
+// ── Environment validation ───────────────────────────────────────────────────
+const requiredEnvVars = [
+  'SUPABASE_URL',
+  'SUPABASE_SERVICE_KEY',
+  'TWILIO_ACCOUNT_SID',
+  'TWILIO_AUTH_TOKEN',
+  'TWILIO_WHATSAPP_FROM',
+  'GEMINI_API_KEY'
+];
+
+const missingEnvVars = requiredEnvVars.filter(v => !process.env[v]);
+if (missingEnvVars.length > 0) {
+  console.error('❌ Missing required environment variables:');
+  missingEnvVars.forEach(v => console.error(`   - ${v}`));
+  process.exit(1);
+}
+
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
@@ -230,14 +247,15 @@ app.post('/webhook', async (req, res) => {
 
   try {
     // Get business from twilio settings
-    const { data: twilioSettings } = await supabase
+    const { data: twilioSettings, error: settingsError } = await supabase
       .from('twilio_settings')
       .select('business_id')
       .eq('is_active', true)
       .limit(1)
-      .single();
+      .maybeSingle();
 
-    if (!twilioSettings) {
+    if (settingsError || !twilioSettings) {
+      console.error('Twilio settings error:', settingsError);
       await sendWhatsApp(phone, 'Servicio no disponible en este momento.');
       return res.sendStatus(200);
     }
@@ -255,4 +273,13 @@ app.post('/webhook', async (req, res) => {
 app.get('/health', (_, res) => res.json({ status: 'ok' }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`BarberBot running on port ${PORT}`));
+const server = app.listen(PORT, () => {
+  console.log('✅ BarberBot started successfully');
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📍 Health check: http://localhost:${PORT}/health`);
+});
+
+server.on('error', (err) => {
+  console.error('❌ Server error:', err);
+  process.exit(1);
+});
