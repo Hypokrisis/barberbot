@@ -7,6 +7,7 @@ const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const twilio = require('twilio');
 const Groq = require('groq-sdk');
+const cron = require('node-cron');
 
 // ── Environment validation ───────────────────────────────────────────────────
 const requiredEnvVars = [
@@ -61,6 +62,25 @@ function formatTime(timeStr) {
   return `${hour}:${String(m).padStart(2,'0')} ${period}`;
 }
 
+// ── Tier helpers ──────────────────────────────────────────────────────────────
+function getPlan(business) {
+  return (business?.plan_status || 'basic').toLowerCase();
+}
+
+function canUseGroq(business) {
+  const plan = getPlan(business);
+  return plan === 'pro' || plan === 'premium';
+}
+
+function canSendReports(business) {
+  const plan = getPlan(business);
+  return plan === 'pro' || plan === 'premium';
+}
+
+function canSendProactive(business) {
+  return getPlan(business) === 'premium';
+}
+
 // ── Supabase helpers ──────────────────────────────────────────────────────────
 async function getBusinessInfo(businessId) {
   const { data: business } = await supabase
@@ -72,6 +92,13 @@ async function getBusinessInfo(businessId) {
     .from('services').select('id,name,duration_minutes,price')
     .eq('business_id', businessId).eq('is_active', true);
   return { business, barbers, services };
+}
+
+async function getOwnerPhone(business) {
+  if (!business?.owner_id) return null;
+  const { data: profile } = await supabase
+    .from('profiles').select('phone').eq('id', business.owner_id).maybeSingle();
+  return profile?.phone || null;
 }
 
 async function getAvailableSlots(barberId, date) {
@@ -140,7 +167,7 @@ async function sendWhatsApp(to, body) {
   });
 }
 
-// ── Groq fallback (only for general questions outside booking flow) ────────────
+// ── Groq fallback (Pro/Premium only — general questions) ──────────────────────
 async function askGroq(session, message, business, services) {
   const systemPrompt = `Eres el asistente de ${business.name}, ${business.city} PR. Responde en máximo 2 líneas. Servicios: ${services.map(s => `${s.name} $${s.price}`).join(', ')}. Para agendar deben escribir "cita".`;
   session.history.push({ role: 'user', content: message });
@@ -155,17 +182,261 @@ async function askGroq(session, message, business, services) {
   return reply;
 }
 
+// ── Reports ───────────────────────────────────────────────────────────────────
+async function buildDailyReport(business, services) {
+  const today = new Date().toISOString().split('T')[0];
+
+  const { data: appts } = await supabase
+    .from('appointments')
+    .select('customer_name, start_time, service_id, status')
+    .eq('business_id', business.id)
+    .eq('appointment_date', today)
+    .neq('status', 'cancelled')
+    .order('start_time', { ascending: true });
+
+  if (!appts || appts.length === 0) return null;
+
+  const now = new Date();
+  const nowMins = now.getHours() * 60 + now.getMinutes();
+
+  const upcoming = appts.filter(a => {
+    const [h, m] = a.start_time.split(':').map(Number);
+    return h * 60 + m > nowMins;
+  });
+
+  const totalRevenue = appts.reduce((sum, a) => {
+    const svc = services.find(s => s.id === a.service_id);
+    return sum + (svc?.price || 0);
+  }, 0);
+
+  const next = upcoming[0];
+  const nextSvc = next ? services.find(s => s.id === next.service_id) : null;
+
+  let msg = `📊 *Spacey Report — ${business.name}*\n`;
+  msg += `📅 ${formatDate(today)}\n\n`;
+  msg += `✂️ Citas hoy: *${appts.length}*\n`;
+  msg += `💰 Ingresos estimados: *$${totalRevenue}*\n\n`;
+
+  if (next) {
+    msg += `⏭️ *Próxima cita:*\n`;
+    msg += `• ${next.customer_name} a las ${formatTime(next.start_time)}`;
+    if (nextSvc) msg += ` — ${nextSvc.name}`;
+    msg += `\n`;
+  }
+
+  if (upcoming.length > 1) {
+    msg += `\n📋 Restantes del día: *${upcoming.length - 1}*\n`;
+    upcoming.slice(1, 4).forEach(a => {
+      const svc = services.find(s => s.id === a.service_id);
+      msg += `• ${formatTime(a.start_time)} ${a.customer_name}${svc ? ` (${svc.name})` : ''}\n`;
+    });
+    if (upcoming.length - 1 > 3) msg += `...y ${upcoming.length - 4} más\n`;
+  }
+
+  if (upcoming.length === 0) {
+    msg += `\n✅ No quedan citas pendientes por hoy.`;
+  }
+
+  return msg;
+}
+
+async function buildClosingReport(business, services) {
+  const today = new Date().toISOString().split('T')[0];
+
+  const { data: appts } = await supabase
+    .from('appointments')
+    .select('customer_name, start_time, service_id, status')
+    .eq('business_id', business.id)
+    .eq('appointment_date', today)
+    .neq('status', 'cancelled')
+    .order('start_time', { ascending: true });
+
+  const totalRevenue = (appts || []).reduce((sum, a) => {
+    const svc = services.find(s => s.id === a.service_id);
+    return sum + (svc?.price || 0);
+  }, 0);
+
+  let msg = `🌙 *Cierre del día — ${business.name}*\n`;
+  msg += `📅 ${formatDate(today)}\n\n`;
+  msg += `✂️ Total de citas: *${appts?.length || 0}*\n`;
+  msg += `💰 Ingresos del día: *$${totalRevenue}*\n\n`;
+  msg += `¡Buen trabajo! Hasta mañana 💈`;
+
+  return msg;
+}
+
+// ── Send 2-hour report to all active Pro/Premium businesses ───────────────────
+async function sendBiHourlyReports() {
+  console.log('[Cron] Sending bi-hourly reports...');
+  try {
+    const { data: businesses } = await supabase
+      .from('businesses')
+      .select('*')
+      .eq('is_active', true)
+      .in('plan_status', ['pro', 'premium']);
+
+    if (!businesses || businesses.length === 0) return;
+
+    for (const business of businesses) {
+      const ownerPhone = await getOwnerPhone(business);
+      if (!ownerPhone) {
+        console.warn(`[Report] No owner phone for ${business.name}`);
+        continue;
+      }
+
+      const { data: services } = await supabase
+        .from('services').select('id,name,price')
+        .eq('business_id', business.id).eq('is_active', true);
+
+      const msg = await buildDailyReport(business, services || []);
+      if (!msg) {
+        console.log(`[Report] No appointments today for ${business.name}, skipping`);
+        continue;
+      }
+
+      await sendWhatsApp(ownerPhone, msg);
+      console.log(`[Report] Sent bi-hourly report to ${business.name} (${ownerPhone})`);
+    }
+  } catch (err) {
+    console.error('[Cron] Error sending bi-hourly reports:', err);
+  }
+}
+
+// ── Send closing report to Premium businesses ─────────────────────────────────
+async function sendClosingReports() {
+  console.log('[Cron] Sending closing reports...');
+  try {
+    const { data: businesses } = await supabase
+      .from('businesses')
+      .select('*')
+      .eq('is_active', true)
+      .eq('plan_status', 'premium');
+
+    if (!businesses || businesses.length === 0) return;
+
+    for (const business of businesses) {
+      const ownerPhone = await getOwnerPhone(business);
+      if (!ownerPhone) continue;
+
+      const { data: services } = await supabase
+        .from('services').select('id,name,price')
+        .eq('business_id', business.id).eq('is_active', true);
+
+      const msg = await buildClosingReport(business, services || []);
+      await sendWhatsApp(ownerPhone, msg);
+      console.log(`[Report] Sent closing report to ${business.name}`);
+    }
+  } catch (err) {
+    console.error('[Cron] Error sending closing reports:', err);
+  }
+}
+
+// ── Send proactive re-engagement to inactive clients (Premium only) ───────────
+async function sendProactiveReengagement() {
+  console.log('[Cron] Sending proactive re-engagement messages...');
+  try {
+    const { data: businesses } = await supabase
+      .from('businesses')
+      .select('*')
+      .eq('is_active', true)
+      .eq('plan_status', 'premium')
+      .eq('whatsapp_marketing_active', true);
+
+    if (!businesses || businesses.length === 0) return;
+
+    for (const business of businesses) {
+      const inactiveDays = business.reminder_inactive_days || 30;
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() - inactiveDays);
+      const cutoffStr = cutoff.toISOString().split('T')[0];
+
+      // Find customers who had an appointment before cutoff and none after
+      const { data: inactiveClients } = await supabase.rpc('get_inactive_clients', {
+        p_business_id: business.id,
+        p_cutoff_date: cutoffStr
+      }).catch(() => ({ data: null }));
+
+      // Fallback: direct query if RPC not available
+      if (!inactiveClients) {
+        const { data: oldAppts } = await supabase
+          .from('appointments')
+          .select('customer_name, customer_phone')
+          .eq('business_id', business.id)
+          .lt('appointment_date', cutoffStr)
+          .neq('status', 'cancelled')
+          .not('customer_phone', 'is', null);
+
+        if (!oldAppts || oldAppts.length === 0) continue;
+
+        // Dedupe by phone
+        const seen = new Set();
+        const candidates = oldAppts.filter(a => {
+          if (seen.has(a.customer_phone)) return false;
+          seen.add(a.customer_phone);
+          return true;
+        });
+
+        // Check each has no recent appointment
+        for (const client of candidates) {
+          const { data: recent } = await supabase
+            .from('appointments')
+            .select('id')
+            .eq('business_id', business.id)
+            .eq('customer_phone', client.customer_phone)
+            .gte('appointment_date', cutoffStr)
+            .limit(1);
+
+          if (recent && recent.length > 0) continue;
+
+          const bookingLink = business.whatsapp_booking_link || `https://spaceyreserve.netlify.app/book/${business.slug}`;
+          const customOffer = business.whatsapp_offer ? `\n\n${business.whatsapp_offer}` : '';
+          const msg = `¡Hola ${client.customer_name}! Hace tiempo no te vemos en ${business.name} 💈${customOffer}\nEsta semana tenemos disponibilidad. ¿Quieres reservar?\n🔗 ${bookingLink}`;
+
+          try {
+            await sendWhatsApp(client.customer_phone, msg);
+            console.log(`[Proactive] Sent re-engagement to ${client.customer_name} for ${business.name}`);
+            // Small delay to avoid Twilio rate limits
+            await new Promise(r => setTimeout(r, 1000));
+          } catch (err) {
+            console.error(`[Proactive] Failed to send to ${client.customer_phone}:`, err.message);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[Cron] Error sending proactive messages:', err);
+  }
+}
+
 // ── State machine ─────────────────────────────────────────────────────────────
 const GREETINGS = new Set(['hola','hi','hello','buenas','hey','ola','buenos dias',
   'buen dia','buenas tardes','buenas noches','info','información','informacion']);
 const BOOKING_WORDS = ['cita','reservar','agendar','turno','quiero','reserva','book'];
+const KEYWORDS = {
+  cancel: ['cancelar','cancel','cancela'],
+  reschedule: ['reagendar','cambiar cita','reprogramar'],
+  yes: ['sí','si','yes','ok','bueno','dale','confirmo'],
+  no: ['no','nop','cancelar'],
+};
+
+function matchesKeyword(msgLower, list) {
+  return list.some(w => msgLower.includes(w));
+}
 
 async function handleMessage(phone, message, businessId) {
   const session = getSession(phone);
   const { business, barbers, services } = await getBusinessInfo(businessId);
   const msg = message.trim();
   const msgLower = msg.toLowerCase();
-  const bookingLink = business.whatsapp_booking_link || 'https://spaceyreserve.netlify.app/book/annlobarberia';
+  const bookingLink = business.whatsapp_booking_link || `https://spaceyreserve.netlify.app/book/${business.slug || 'annlobarberia'}`;
+  const plan = getPlan(business);
+
+  // ── Global keywords (all tiers) ────────────────────────────────────────────
+  if (matchesKeyword(msgLower, KEYWORDS.cancel) && session.state !== 'idle') {
+    session.state = 'idle';
+    session.data = {};
+    return `Proceso cancelado. Escribe *"hola"* para comenzar de nuevo.`;
+  }
 
   // ── IDLE ──────────────────────────────────────────────────────────────────
   if (session.state === 'idle') {
@@ -177,7 +448,15 @@ async function handleMessage(phone, message, businessId) {
       session.state = 'name';
       return `¡Perfecto! 💈 ¿Cuál es tu nombre?`;
     }
-    return askGroq(session, msg, business, services);
+
+    // Pro/Premium: use Groq for general questions
+    if (canUseGroq(business)) {
+      return askGroq(session, msg, business, services);
+    }
+
+    // Basic/Trial: keyword-only fallback
+    const svcList = services.map(s => `• ${s.name}: $${s.price}`).join('\n');
+    return `¡Hola! Soy el asistente de *${business.name}* 💈\n\n*Servicios:*\n${svcList}\n\nEscribe *"cita"* para agendar o visita:\n${bookingLink}`;
   }
 
   // ── NAME ──────────────────────────────────────────────────────────────────
@@ -313,8 +592,42 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-app.get('/health', (_, res) => res.json({ status: 'ok' }));
+app.get('/health', (_, res) => res.json({ status: 'ok', version: '2.0.0' }));
 
+// ── Manual report trigger (for testing) ──────────────────────────────────────
+app.post('/admin/report', async (req, res) => {
+  const { type = 'bihourly' } = req.body;
+  try {
+    if (type === 'closing') {
+      await sendClosingReports();
+    } else {
+      await sendBiHourlyReports();
+    }
+    res.json({ status: 'ok', type });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Cron jobs ─────────────────────────────────────────────────────────────────
+// Every 2 hours from 8am to 6pm (Pro + Premium)
+cron.schedule('0 8,10,12,14,16,18 * * *', () => {
+  sendBiHourlyReports();
+});
+
+// Daily closing report at 8pm (Premium only)
+cron.schedule('0 20 * * *', () => {
+  sendClosingReports();
+});
+
+// Weekly proactive re-engagement every Monday at 9am (Premium only)
+cron.schedule('0 9 * * 1', () => {
+  sendProactiveReengagement();
+});
+
+console.log('✅ Cron jobs registered: bi-hourly reports, closing report, proactive re-engagement');
+
+// ── Server ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
   console.log('✅ BarberBot started successfully');
