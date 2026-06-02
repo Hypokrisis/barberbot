@@ -151,20 +151,48 @@ async function getNextAvailableDays(barberId, count = 5) {
   return results;
 }
 
+// Normaliza teléfono a solo dígitos para comparar
+function normalizePhone(phone) {
+  return phone.replace(/\D/g, '');
+}
+
+// Busca si el teléfono corresponde a un usuario registrado en Spacey
+async function findRegisteredUser(phone) {
+  const normalized = normalizePhone(phone);
+  const { data: profiles } = await supabase
+    .from('profiles')
+    .select('id, full_name, phone')
+    .not('phone', 'is', null);
+
+  if (!profiles) return null;
+  return profiles.find(p => normalizePhone(p.phone || '') === normalized) || null;
+}
+
 async function createAppointment(data) {
+  // Intentar linkear con usuario registrado por teléfono
+  const registeredUser = await findRegisteredUser(data.customerPhone);
+
+  const payload = {
+    business_id: data.businessId,
+    barber_id: data.barberId,
+    service_id: data.serviceId,
+    customer_name: data.customerName,
+    customer_phone: data.customerPhone,
+    appointment_date: data.date,
+    start_time: data.startTime,
+    end_time: data.endTime,
+    status: 'confirmed',
+  };
+
+  // Si el usuario tiene cuenta, vincular la cita a su perfil
+  if (registeredUser) {
+    payload.client_id = registeredUser.id;
+    payload.customer_user_id = registeredUser.id;
+  }
+
   const { data: appt, error } = await supabase
-    .from('appointments').insert({
-      business_id: data.businessId,
-      barber_id: data.barberId,
-      service_id: data.serviceId,
-      customer_name: data.customerName,
-      customer_phone: data.customerPhone,
-      appointment_date: data.date,
-      start_time: data.startTime,
-      end_time: data.endTime,
-      status: 'confirmed'
-    }).select().single();
-  return { appt, error };
+    .from('appointments').insert(payload).select().single();
+  return { appt, error, isGuest: !registeredUser };
 }
 
 async function getActiveAppointment(phone, businessId) {
@@ -704,7 +732,7 @@ async function handleMessage(phone, message, businessId) {
     const endMin = h * 60 + m + (service.duration_minutes || 30);
     const endTime = `${String(Math.floor(endMin/60)).padStart(2,'0')}:${String(endMin%60).padStart(2,'0')}`;
 
-    const { error } = await createAppointment({
+    const { error, isGuest } = await createAppointment({
       businessId,
       barberId: session.data.barberId,
       serviceId: service.id,
@@ -724,7 +752,24 @@ async function handleMessage(phone, message, businessId) {
     sessions[phone] = { state: 'idle', data: {}, history: [], lastActivity: Date.now() };
 
     const barber = barbers.find(b => b.id === session.data.barberId);
-    return `✅ *¡Cita confirmada, ${customerName}!*\n\n✂️ ${service.name}\n💈 ${barber?.name}\n📅 ${formatDate(session.data.selectedDate)} a las ${formatTime(startTime)}\n\n_Responde "cambiar mi cita" si necesitas reagendar_\n\n🔗 ${bookingLink}`;
+    const confirmMsg = `✅ *¡Cita confirmada, ${customerName}!*\n\n✂️ ${service.name}\n💈 ${barber?.name}\n📅 ${formatDate(session.data.selectedDate)} a las ${formatTime(startTime)}\n\n_Responde "cambiar mi cita" si necesitas reagendar_\n\n🔗 ${bookingLink}`;
+
+    // Para invitados: enviar mensaje de conversión 3 segundos después
+    if (isGuest) {
+      const encodedPhone = encodeURIComponent(phone);
+      const registerLink = `https://spaceyreserve.netlify.app/register?phone=${encodedPhone}`;
+      setTimeout(async () => {
+        try {
+          await sendWhatsApp(phone,
+            `💡 *¿Sabías que puedes crear una cuenta gratis?*\n\nCon tu cuenta en Spacey Reserve puedes:\n✅ Ver el historial de tus citas\n✅ Reagendar desde la web\n✅ Recibir ofertas exclusivas\n✅ Acumular visitas y ser VIP\n\n🔗 ${registerLink}`
+          );
+        } catch (err) {
+          console.error('[Conversion] Error sending guest conversion message:', err.message);
+        }
+      }, 4000);
+    }
+
+    return confirmMsg;
   }
 
   // Fallback
