@@ -46,7 +46,14 @@ function getSession(phone) {
   return sessions[phone];
 }
 
-// ── Format helpers ────────────────────────────────────────────────────────────
+// ── Date helpers ──────────────────────────────────────────────────────────────
+// Puerto Rico is UTC-4 year-round (no DST)
+function todayPR() {
+  const now = new Date();
+  const prTime = new Date(now.getTime() - 4 * 60 * 60 * 1000);
+  return prTime.toISOString().split('T')[0];
+}
+
 function formatDate(dateStr) {
   const months = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto',
                   'septiembre','octubre','noviembre','diciembre'];
@@ -110,7 +117,7 @@ async function getAvailableSlots(barberId, date) {
   if (!schedule) return [];
 
   const { data: appointments } = await supabase
-    .from('appointments').select('start_time')
+    .from('appointments').select('start_time,end_time')
     .eq('barber_id', barberId).eq('appointment_date', date).neq('status', 'cancelled');
 
   const slots = [];
@@ -130,7 +137,8 @@ async function getAvailableSlots(barberId, date) {
 
 async function getNextAvailableDays(barberId, count = 5) {
   const results = [];
-  const today = new Date();
+  const todayStr = todayPR(); // Use PR local date, not UTC
+  const today = new Date(todayStr + 'T12:00:00');
   let offset = 1;
   while (results.length < count && offset <= 30) {
     const d = new Date(today);
@@ -159,6 +167,21 @@ async function createAppointment(data) {
   return { appt, error };
 }
 
+async function getActiveAppointment(phone, businessId) {
+  const todayStr = todayPR();
+  const { data } = await supabase
+    .from('appointments')
+    .select('id, customer_name, appointment_date, start_time, barber_id, service_id')
+    .eq('business_id', businessId)
+    .eq('customer_phone', phone)
+    .eq('status', 'confirmed')
+    .gte('appointment_date', todayStr)
+    .order('appointment_date', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  return data;
+}
+
 async function sendWhatsApp(to, body) {
   await twilioClient.messages.create({
     from: process.env.TWILIO_WHATSAPP_FROM,
@@ -167,24 +190,41 @@ async function sendWhatsApp(to, body) {
   });
 }
 
-// ── Groq fallback (Pro/Premium only — general questions) ──────────────────────
+// ── Groq — solo para preguntas generales, nunca para el flujo de reservas ─────
 async function askGroq(session, message, business, services) {
-  const systemPrompt = `Eres el asistente de ${business.name}, ${business.city} PR. Responde en máximo 2 líneas. Servicios: ${services.map(s => `${s.name} $${s.price}`).join(', ')}. Para agendar deben escribir "cita".`;
+  // Groq solo responde preguntas informativas. Si detecta intención de reservar,
+  // redirige al flujo del bot sin procesar.
+  const systemPrompt = `Eres el asistente de ${business.name} en ${business.city || 'Puerto Rico'}.
+REGLAS ESTRICTAS:
+- Responde SOLO preguntas sobre el negocio (precios, horarios, ubicación, servicios)
+- Máximo 2 líneas de respuesta
+- Si el cliente quiere agendar, cancelar o cambiar una cita: responde SOLO con "→CITA"
+- Servicios disponibles: ${services.map(s => `${s.name} $${s.price}`).join(', ')}
+- No inventes información que no esté en los datos`;
+
   session.history.push({ role: 'user', content: message });
   const completion = await groq.chat.completions.create({
     model: 'llama-3.1-8b-instant',
-    messages: [{ role: 'system', content: systemPrompt }, ...session.history.slice(-6)],
-    temperature: 0.3,
-    max_tokens: 150
+    messages: [{ role: 'system', content: systemPrompt }, ...session.history.slice(-4)],
+    temperature: 0.2,
+    max_tokens: 100
   });
   const reply = completion.choices[0].message.content.trim();
+
+  // Si Groq detectó intención de reserva, redirigir al flujo nativo
+  if (reply.startsWith('→CITA') || reply.includes('→CITA')) {
+    session.history.push({ role: 'assistant', content: '[redirigido a flujo de cita]' });
+    session.state = 'name';
+    return `¡Claro! 💈 Para agendar tu cita, ¿cuál es tu nombre?`;
+  }
+
   session.history.push({ role: 'assistant', content: reply });
   return reply;
 }
 
 // ── Reports ───────────────────────────────────────────────────────────────────
 async function buildDailyReport(business, services) {
-  const today = new Date().toISOString().split('T')[0];
+  const today = todayPR();
 
   const { data: appts } = await supabase
     .from('appointments')
@@ -197,7 +237,7 @@ async function buildDailyReport(business, services) {
   if (!appts || appts.length === 0) return null;
 
   const now = new Date();
-  const nowMins = now.getHours() * 60 + now.getMinutes();
+  const nowMins = (now.getUTCHours() - 4) * 60 + now.getUTCMinutes(); // PR time
 
   const upcoming = appts.filter(a => {
     const [h, m] = a.start_time.split(':').map(Number);
@@ -218,14 +258,14 @@ async function buildDailyReport(business, services) {
   msg += `💰 Ingresos estimados: *$${totalRevenue}*\n\n`;
 
   if (next) {
-    msg += `⏭️ *Próxima cita:*\n`;
+    msg += `⏭️ *Próxima:*\n`;
     msg += `• ${next.customer_name} a las ${formatTime(next.start_time)}`;
     if (nextSvc) msg += ` — ${nextSvc.name}`;
     msg += `\n`;
   }
 
   if (upcoming.length > 1) {
-    msg += `\n📋 Restantes del día: *${upcoming.length - 1}*\n`;
+    msg += `\n📋 Restantes: *${upcoming.length - 1}*\n`;
     upcoming.slice(1, 4).forEach(a => {
       const svc = services.find(s => s.id === a.service_id);
       msg += `• ${formatTime(a.start_time)} ${a.customer_name}${svc ? ` (${svc.name})` : ''}\n`;
@@ -234,14 +274,14 @@ async function buildDailyReport(business, services) {
   }
 
   if (upcoming.length === 0) {
-    msg += `\n✅ No quedan citas pendientes por hoy.`;
+    msg += `\n✅ No quedan citas pendientes.`;
   }
 
   return msg;
 }
 
 async function buildClosingReport(business, services) {
-  const today = new Date().toISOString().split('T')[0];
+  const today = todayPR();
 
   const { data: appts } = await supabase
     .from('appointments')
@@ -265,7 +305,6 @@ async function buildClosingReport(business, services) {
   return msg;
 }
 
-// ── Send 2-hour report to all active Pro/Premium businesses ───────────────────
 async function sendBiHourlyReports() {
   console.log('[Cron] Sending bi-hourly reports...');
   try {
@@ -279,30 +318,23 @@ async function sendBiHourlyReports() {
 
     for (const business of businesses) {
       const ownerPhone = await getOwnerPhone(business);
-      if (!ownerPhone) {
-        console.warn(`[Report] No owner phone for ${business.name}`);
-        continue;
-      }
+      if (!ownerPhone) continue;
 
       const { data: services } = await supabase
         .from('services').select('id,name,price')
         .eq('business_id', business.id).eq('is_active', true);
 
       const msg = await buildDailyReport(business, services || []);
-      if (!msg) {
-        console.log(`[Report] No appointments today for ${business.name}, skipping`);
-        continue;
-      }
+      if (!msg) continue;
 
       await sendWhatsApp(ownerPhone, msg);
-      console.log(`[Report] Sent bi-hourly report to ${business.name} (${ownerPhone})`);
+      console.log(`[Report] Sent to ${business.name} (${ownerPhone})`);
     }
   } catch (err) {
     console.error('[Cron] Error sending bi-hourly reports:', err);
   }
 }
 
-// ── Send closing report to Premium businesses ─────────────────────────────────
 async function sendClosingReports() {
   console.log('[Cron] Sending closing reports...');
   try {
@@ -324,16 +356,15 @@ async function sendClosingReports() {
 
       const msg = await buildClosingReport(business, services || []);
       await sendWhatsApp(ownerPhone, msg);
-      console.log(`[Report] Sent closing report to ${business.name}`);
+      console.log(`[Report] Closing sent to ${business.name}`);
     }
   } catch (err) {
     console.error('[Cron] Error sending closing reports:', err);
   }
 }
 
-// ── Send proactive re-engagement to inactive clients (Premium only) ───────────
 async function sendProactiveReengagement() {
-  console.log('[Cron] Sending proactive re-engagement messages...');
+  console.log('[Cron] Sending proactive re-engagement...');
   try {
     const { data: businesses } = await supabase
       .from('businesses')
@@ -346,60 +377,48 @@ async function sendProactiveReengagement() {
 
     for (const business of businesses) {
       const inactiveDays = business.reminder_inactive_days || 30;
-      const cutoff = new Date();
+      const cutoff = new Date(todayPR() + 'T12:00:00');
       cutoff.setDate(cutoff.getDate() - inactiveDays);
       const cutoffStr = cutoff.toISOString().split('T')[0];
 
-      // Find customers who had an appointment before cutoff and none after
-      const { data: inactiveClients } = await supabase.rpc('get_inactive_clients', {
-        p_business_id: business.id,
-        p_cutoff_date: cutoffStr
-      }).catch(() => ({ data: null }));
+      const { data: oldAppts } = await supabase
+        .from('appointments')
+        .select('customer_name, customer_phone')
+        .eq('business_id', business.id)
+        .lt('appointment_date', cutoffStr)
+        .neq('status', 'cancelled')
+        .not('customer_phone', 'is', null);
 
-      // Fallback: direct query if RPC not available
-      if (!inactiveClients) {
-        const { data: oldAppts } = await supabase
+      if (!oldAppts || oldAppts.length === 0) continue;
+
+      const seen = new Set();
+      const candidates = oldAppts.filter(a => {
+        if (seen.has(a.customer_phone)) return false;
+        seen.add(a.customer_phone);
+        return true;
+      });
+
+      for (const client of candidates) {
+        const { data: recent } = await supabase
           .from('appointments')
-          .select('customer_name, customer_phone')
+          .select('id')
           .eq('business_id', business.id)
-          .lt('appointment_date', cutoffStr)
-          .neq('status', 'cancelled')
-          .not('customer_phone', 'is', null);
+          .eq('customer_phone', client.customer_phone)
+          .gte('appointment_date', cutoffStr)
+          .limit(1);
 
-        if (!oldAppts || oldAppts.length === 0) continue;
+        if (recent && recent.length > 0) continue;
 
-        // Dedupe by phone
-        const seen = new Set();
-        const candidates = oldAppts.filter(a => {
-          if (seen.has(a.customer_phone)) return false;
-          seen.add(a.customer_phone);
-          return true;
-        });
+        const bookingLink = business.whatsapp_booking_link || `https://spaceyreserve.netlify.app/book/${business.slug}`;
+        const customOffer = business.whatsapp_offer ? `\n\n${business.whatsapp_offer}` : '';
+        const msg = `¡Hola ${client.customer_name}! Hace tiempo no te vemos en ${business.name} 💈${customOffer}\nEsta semana tenemos disponibilidad. ¿Quieres reservar?\n🔗 ${bookingLink}`;
 
-        // Check each has no recent appointment
-        for (const client of candidates) {
-          const { data: recent } = await supabase
-            .from('appointments')
-            .select('id')
-            .eq('business_id', business.id)
-            .eq('customer_phone', client.customer_phone)
-            .gte('appointment_date', cutoffStr)
-            .limit(1);
-
-          if (recent && recent.length > 0) continue;
-
-          const bookingLink = business.whatsapp_booking_link || `https://spaceyreserve.netlify.app/book/${business.slug}`;
-          const customOffer = business.whatsapp_offer ? `\n\n${business.whatsapp_offer}` : '';
-          const msg = `¡Hola ${client.customer_name}! Hace tiempo no te vemos en ${business.name} 💈${customOffer}\nEsta semana tenemos disponibilidad. ¿Quieres reservar?\n🔗 ${bookingLink}`;
-
-          try {
-            await sendWhatsApp(client.customer_phone, msg);
-            console.log(`[Proactive] Sent re-engagement to ${client.customer_name} for ${business.name}`);
-            // Small delay to avoid Twilio rate limits
-            await new Promise(r => setTimeout(r, 1000));
-          } catch (err) {
-            console.error(`[Proactive] Failed to send to ${client.customer_phone}:`, err.message);
-          }
+        try {
+          await sendWhatsApp(client.customer_phone, msg);
+          console.log(`[Proactive] Sent to ${client.customer_name}`);
+          await new Promise(r => setTimeout(r, 1000));
+        } catch (err) {
+          console.error(`[Proactive] Failed to send to ${client.customer_phone}:`, err.message);
         }
       }
     }
@@ -409,19 +428,23 @@ async function sendProactiveReengagement() {
 }
 
 // ── State machine ─────────────────────────────────────────────────────────────
-const GREETINGS = new Set(['hola','hi','hello','buenas','hey','ola','buenos dias',
-  'buen dia','buenas tardes','buenas noches','info','información','informacion']);
-const BOOKING_WORDS = ['cita','reservar','agendar','turno','quiero','reserva','book'];
-const KEYWORDS = {
-  cancel: ['cancelar','cancel','cancela'],
-  reschedule: ['reagendar','cambiar cita','reprogramar'],
-  yes: ['sí','si','yes','ok','bueno','dale','confirmo'],
-  no: ['no','nop','cancelar'],
-};
+const GREETINGS = new Set([
+  'hola','hi','hello','buenas','hey','ola',
+  'buenos dias','buen dia','buenas tardes','buenas noches',
+  'info','información','informacion'
+]);
 
-function matchesKeyword(msgLower, list) {
-  return list.some(w => msgLower.includes(w));
-}
+// Palabras específicas de booking — "quiero" eliminado por ser demasiado genérico
+const BOOKING_WORDS = ['cita','reservar','agendar','turno','reserva','book','nueva cita','hacer cita'];
+
+// Palabras de reagendar — se chequean ANTES que BOOKING_WORDS
+const REAGENDAR_WORDS = ['reagendar','cambiar cita','cambiar mi cita','mover cita','reprogramar','reschedule','cambio de cita'];
+
+// Palabras de cancelar cita real (no solo resetear sesión)
+const CANCELAR_CITA_WORDS = ['cancelar mi cita','quiero cancelar','borrar mi cita'];
+
+// Solo resetea el flujo del bot, no cancela citas en DB
+const RESET_FLOW_WORDS = ['cancelar','salir','exit','reset','empezar','inicio'];
 
 async function handleMessage(phone, message, businessId) {
   const session = getSession(phone);
@@ -429,34 +452,177 @@ async function handleMessage(phone, message, businessId) {
   const msg = message.trim();
   const msgLower = msg.toLowerCase();
   const bookingLink = business.whatsapp_booking_link || `https://spaceyreserve.netlify.app/book/${business.slug || 'annlobarberia'}`;
-  const plan = getPlan(business);
 
-  // ── Global keywords (all tiers) ────────────────────────────────────────────
-  if (matchesKeyword(msgLower, KEYWORDS.cancel) && session.state !== 'idle') {
+  // ── Reset de flujo (solo cuando está en medio de un proceso) ──────────────
+  if (session.state !== 'idle' &&
+      RESET_FLOW_WORDS.some(w => msgLower === w)) {
     session.state = 'idle';
     session.data = {};
-    return `Proceso cancelado. Escribe *"hola"* para comenzar de nuevo.`;
+    return `Proceso cancelado. Escribe *"hola"* para comenzar de nuevo 👋`;
   }
 
   // ── IDLE ──────────────────────────────────────────────────────────────────
   if (session.state === 'idle') {
+
+    // Saludo
     if (GREETINGS.has(msgLower)) {
       const svcList = services.map(s => `• ${s.name}: $${s.price}`).join('\n');
-      return `¡Hola! Soy el asistente de *${business.name}* 💈\n\n*Servicios:*\n${svcList}\n\nEscribe *"cita"* para agendar por aquí 📅`;
+      return `¡Hola! Soy el asistente de *${business.name}* 💈\n\n*Servicios:*\n${svcList}\n\nEscribe *"cita"* para agendar 📅 o *"cambiar mi cita"* para reagendar.`;
     }
+
+    // Reagendar — chequeado ANTES que booking para evitar confusión
+    if (REAGENDAR_WORDS.some(w => msgLower.includes(w))) {
+      const existing = await getActiveAppointment(phone, businessId);
+      if (!existing) {
+        return `No encontré una cita activa para tu número. ¿Quieres *agendar* una nueva? Escribe *"cita"*.`;
+      }
+      // Buscar barber y service para mostrar el resumen
+      const barber = barbers.find(b => b.id === existing.barber_id);
+      const service = services.find(s => s.id === existing.service_id);
+      session.state = 'reagendar_confirm';
+      session.data.existingAppointmentId = existing.id;
+      session.data.existingBarberId = existing.barber_id;
+      session.data.existingServiceId = existing.service_id;
+      session.data.customerName = existing.customer_name;
+      return `📅 Tu cita actual:\n\n✂️ ${service?.name || 'Servicio'}\n💈 ${barber?.name || 'Barbero'}\n🗓 ${formatDate(existing.appointment_date)} a las ${formatTime(existing.start_time)}\n\n¿Quieres cambiarla?\n1. Sí, reagendar\n2. No, mantenerla`;
+    }
+
+    // Cancelar cita real
+    if (CANCELAR_CITA_WORDS.some(w => msgLower.includes(w))) {
+      const existing = await getActiveAppointment(phone, businessId);
+      if (!existing) {
+        return `No encontré una cita activa para tu número.`;
+      }
+      const barber = barbers.find(b => b.id === existing.barber_id);
+      const service = services.find(s => s.id === existing.service_id);
+      session.state = 'cancel_confirm';
+      session.data.existingAppointmentId = existing.id;
+      session.data.customerName = existing.customer_name;
+      return `⚠️ ¿Seguro que quieres cancelar?\n\n✂️ ${service?.name || 'Servicio'}\n💈 ${barber?.name || 'Barbero'}\n🗓 ${formatDate(existing.appointment_date)} a las ${formatTime(existing.start_time)}\n\n1. Sí, cancelar\n2. No, mantenerla`;
+    }
+
+    // Iniciar booking
     if (BOOKING_WORDS.some(w => msgLower.includes(w))) {
       session.state = 'name';
       return `¡Perfecto! 💈 ¿Cuál es tu nombre?`;
     }
 
-    // Pro/Premium: use Groq for general questions
+    // Pro/Premium: Groq para preguntas generales
     if (canUseGroq(business)) {
       return askGroq(session, msg, business, services);
     }
 
-    // Basic/Trial: keyword-only fallback
+    // Basic/Trial: respuesta genérica
     const svcList = services.map(s => `• ${s.name}: $${s.price}`).join('\n');
     return `¡Hola! Soy el asistente de *${business.name}* 💈\n\n*Servicios:*\n${svcList}\n\nEscribe *"cita"* para agendar o visita:\n${bookingLink}`;
+  }
+
+  // ── REAGENDAR CONFIRM ─────────────────────────────────────────────────────
+  if (session.state === 'reagendar_confirm') {
+    if (msg === '1' || msgLower.includes('sí') || msgLower === 'si' || msgLower === 'dale') {
+      // Obtener fechas disponibles para el mismo barbero y servicio
+      const service = services.find(s => s.id === session.data.existingServiceId);
+      const days = await getNextAvailableDays(session.data.existingBarberId, 5);
+      if (days.length === 0) {
+        session.state = 'idle';
+        session.data = {};
+        return `No hay fechas disponibles en los próximos 30 días para reagendar. Contáctanos directamente.`;
+      }
+      session.data.availableDays = days;
+      const list = days.map((d, i) => `${i+1}. ${formatDate(d.date)}`).join('\n');
+      session.state = 'reagendar_date';
+      return `*${service?.name || 'Servicio'}* ✓\n\nElige la nueva fecha:\n${list}`;
+    } else if (msg === '2' || msgLower === 'no') {
+      session.state = 'idle';
+      session.data = {};
+      return `¡Perfecto! Tu cita se mantiene igual. ¡Te esperamos! 💈`;
+    } else {
+      return `Responde *1* para reagendar o *2* para mantener tu cita.`;
+    }
+  }
+
+  // ── REAGENDAR DATE ────────────────────────────────────────────────────────
+  if (session.state === 'reagendar_date') {
+    const num = parseInt(msg) - 1;
+    const days = session.data.availableDays;
+    if (isNaN(num) || num < 0 || num >= days.length) {
+      const list = days.map((d, i) => `${i+1}. ${formatDate(d.date)}`).join('\n');
+      return `Elige un número:\n${list}`;
+    }
+    session.data.selectedDate = days[num].date;
+    const slots = await getAvailableSlots(session.data.existingBarberId, session.data.selectedDate);
+    if (slots.length === 0) {
+      const list = days.map((d, i) => `${i+1}. ${formatDate(d.date)}`).join('\n');
+      return `Sin horarios para esa fecha. Elige otra:\n${list}`;
+    }
+    session.data.availableSlots = slots;
+    const list = slots.map((s, i) => `${i+1}. ${formatTime(s)}`).join('\n');
+    session.state = 'reagendar_slot';
+    return `*${formatDate(session.data.selectedDate)}* ✓\n\nHorarios disponibles:\n${list}`;
+  }
+
+  // ── REAGENDAR SLOT ────────────────────────────────────────────────────────
+  if (session.state === 'reagendar_slot') {
+    const num = parseInt(msg) - 1;
+    const slots = session.data.availableSlots;
+    if (isNaN(num) || num < 0 || num >= slots.length) {
+      const list = slots.map((s, i) => `${i+1}. ${formatTime(s)}`).join('\n');
+      return `Elige un número:\n${list}`;
+    }
+
+    const startTime = slots[num];
+    const service = services.find(s => s.id === session.data.existingServiceId);
+    const barber = barbers.find(b => b.id === session.data.existingBarberId);
+    const [h, m] = startTime.split(':').map(Number);
+    const endMin = h * 60 + m + (service?.duration_minutes || 30);
+    const endTime = `${String(Math.floor(endMin/60)).padStart(2,'0')}:${String(endMin%60).padStart(2,'0')}`;
+
+    // Save data before clearing session
+    const customerName = session.data.customerName || 'cliente';
+    const newDate = session.data.selectedDate;
+    const apptId = session.data.existingAppointmentId;
+
+    const { error } = await supabase
+      .from('appointments')
+      .update({
+        appointment_date: newDate,
+        start_time: startTime,
+        end_time: endTime,
+      })
+      .eq('id', apptId);
+
+    session.state = 'idle';
+    session.data = {};
+
+    if (error) {
+      console.error('Reagendar error:', error);
+      return `Error al reagendar. Intenta de nuevo o escribe *"cita"* para una nueva.`;
+    }
+
+    return `✅ *¡Cita reagendada, ${customerName}!*\n\n✂️ ${service?.name || 'Servicio'}\n💈 ${barber?.name || 'Barbero'}\n📅 ${formatDate(newDate)} a las ${formatTime(startTime)}\n\n¡Te esperamos! 💈`;
+  }
+
+  // ── CANCEL CONFIRM ────────────────────────────────────────────────────────
+  if (session.state === 'cancel_confirm') {
+    if (msg === '1' || msgLower.includes('sí') || msgLower === 'si') {
+      const { error } = await supabase
+        .from('appointments')
+        .update({ status: 'cancelled' })
+        .eq('id', session.data.existingAppointmentId);
+
+      session.state = 'idle';
+      const name = session.data.customerName;
+      session.data = {};
+
+      if (error) {
+        return `Error al cancelar. Contáctanos directamente.`;
+      }
+      return `Cita cancelada, ${name}. Si cambias de opinión escribe *"cita"* para agendar de nuevo. ¡Hasta pronto! 👋`;
+    } else {
+      session.state = 'idle';
+      session.data = {};
+      return `¡Perfecto! Tu cita se mantiene. ¡Te esperamos! 💈`;
+    }
   }
 
   // ── NAME ──────────────────────────────────────────────────────────────────
@@ -554,15 +720,16 @@ async function handleMessage(phone, message, businessId) {
       return `Error al crear la cita. Por favor intenta de nuevo.`;
     }
 
+    const customerName = session.data.customerName;
     sessions[phone] = { state: 'idle', data: {}, history: [], lastActivity: Date.now() };
 
     const barber = barbers.find(b => b.id === session.data.barberId);
-    return `✅ *¡Cita confirmada para ${session.data.customerName}!*\n\n✂️ ${service.name}\n💈 ${barber?.name}\n📅 ${formatDate(session.data.selectedDate)} a las ${formatTime(startTime)}\n\n🔗 Ver/cancelar cita:\n${bookingLink}\n\n¡Te esperamos! 💈`;
+    return `✅ *¡Cita confirmada, ${customerName}!*\n\n✂️ ${service.name}\n💈 ${barber?.name}\n📅 ${formatDate(session.data.selectedDate)} a las ${formatTime(startTime)}\n\n_Responde "cambiar mi cita" si necesitas reagendar_\n\n🔗 ${bookingLink}`;
   }
 
   // Fallback
   session.state = 'idle';
-  return `Escribe *"hola"* para ver servicios o *"cita"* para agendar.`;
+  return `Escribe *"hola"* para ver servicios, *"cita"* para agendar, o *"cambiar mi cita"* para reagendar.`;
 }
 
 // ── Webhook ───────────────────────────────────────────────────────────────────
@@ -570,7 +737,7 @@ app.post('/webhook', async (req, res) => {
   const { Body, From } = req.body;
   const phone = From.replace('whatsapp:', '');
 
-  res.status(200).end(); // Respond immediately to prevent Twilio retries
+  res.status(200).end();
 
   console.log(`[${phone}] ${Body}`);
 
@@ -592,17 +759,13 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-app.get('/health', (_, res) => res.json({ status: 'ok', version: '2.0.0' }));
+app.get('/health', (_, res) => res.json({ status: 'ok', version: '2.1.0' }));
 
-// ── Manual report trigger (for testing) ──────────────────────────────────────
 app.post('/admin/report', async (req, res) => {
   const { type = 'bihourly' } = req.body;
   try {
-    if (type === 'closing') {
-      await sendClosingReports();
-    } else {
-      await sendBiHourlyReports();
-    }
+    if (type === 'closing') await sendClosingReports();
+    else await sendBiHourlyReports();
     res.json({ status: 'ok', type });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -610,27 +773,21 @@ app.post('/admin/report', async (req, res) => {
 });
 
 // ── Cron jobs ─────────────────────────────────────────────────────────────────
-// Every 2 hours from 8am to 6pm (Pro + Premium)
-cron.schedule('0 8,10,12,14,16,18 * * *', () => {
-  sendBiHourlyReports();
-});
+// Cada 2 horas 8am-6pm PR (PR = UTC-4, por eso +4 en UTC)
+cron.schedule('0 12,14,16,18,20,22 * * *', () => sendBiHourlyReports());
 
-// Daily closing report at 8pm (Premium only)
-cron.schedule('0 20 * * *', () => {
-  sendClosingReports();
-});
+// Reporte de cierre 8pm PR = medianoche UTC
+cron.schedule('0 0 * * *', () => sendClosingReports());
 
-// Weekly proactive re-engagement every Monday at 9am (Premium only)
-cron.schedule('0 9 * * 1', () => {
-  sendProactiveReengagement();
-});
+// Re-engagement semanal lunes 9am PR = lunes 1pm UTC
+cron.schedule('0 13 * * 1', () => sendProactiveReengagement());
 
-console.log('✅ Cron jobs registered: bi-hourly reports, closing report, proactive re-engagement');
+console.log('✅ Cron jobs registered');
 
 // ── Server ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
-  console.log('✅ BarberBot started successfully');
+  console.log('✅ BarberBot v2.1.0 started');
   console.log(`🚀 Server running on port ${PORT}`);
 });
 
