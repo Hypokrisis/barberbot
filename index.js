@@ -13,7 +13,7 @@ const cron = require('node-cron');
 const requiredEnvVars = [
   'SUPABASE_URL', 'SUPABASE_SERVICE_KEY',
   'TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_WHATSAPP_FROM',
-  'GROQ_API_KEY'
+  'GROQ_API_KEY', 'WEBHOOK_URL'
 ];
 const missingEnvVars = requiredEnvVars.filter(v => !process.env[v]);
 if (missingEnvVars.length > 0) {
@@ -777,12 +777,80 @@ async function handleMessage(phone, message, businessId) {
   return `Escribe *"hola"* para ver servicios, *"cita"* para agendar, o *"cambiar mi cita"* para reagendar.`;
 }
 
+// ── Rate limiter: 10 msgs / phone / 60s ──────────────────────────────────────
+const rateLimitMap = new Map(); // phone → { count, windowStart }
+const RATE_LIMIT = 10;
+const RATE_WINDOW_MS = 60 * 1000;
+
+function isRateLimited(phone) {
+  const now = Date.now();
+  const entry = rateLimitMap.get(phone);
+  if (!entry || now - entry.windowStart > RATE_WINDOW_MS) {
+    rateLimitMap.set(phone, { count: 1, windowStart: now });
+    return false;
+  }
+  entry.count++;
+  if (entry.count > RATE_LIMIT) {
+    console.warn(`[RATE_LIMIT] ${phone} — ${entry.count} msgs in window`);
+    return true;
+  }
+  return false;
+}
+
+// Clean up stale rate limit entries every 5 minutes
+setInterval(() => {
+  const cutoff = Date.now() - RATE_WINDOW_MS;
+  for (const [phone, entry] of rateLimitMap.entries()) {
+    if (entry.windowStart < cutoff) rateLimitMap.delete(phone);
+  }
+}, 5 * 60 * 1000);
+
+// ── Twilio signature validator middleware ─────────────────────────────────────
+function validateTwilioSignature(req, res, next) {
+  // Skip validation in local dev if flag is set
+  if (process.env.SKIP_TWILIO_VALIDATION === 'true') {
+    console.warn('[WARN] Twilio signature validation SKIPPED (dev mode)');
+    return next();
+  }
+
+  const signature = req.headers['x-twilio-signature'];
+  const url = process.env.WEBHOOK_URL;
+
+  if (!signature) {
+    console.warn('[SECURITY] Missing X-Twilio-Signature header — rejected');
+    return res.status(403).send('Forbidden');
+  }
+
+  const isValid = twilio.validateRequest(
+    process.env.TWILIO_AUTH_TOKEN,
+    signature,
+    url,
+    req.body
+  );
+
+  if (!isValid) {
+    console.warn(`[SECURITY] Invalid Twilio signature from ${req.ip} — rejected`);
+    return res.status(403).send('Forbidden');
+  }
+
+  next();
+}
+
 // ── Webhook ───────────────────────────────────────────────────────────────────
-app.post('/webhook', async (req, res) => {
+app.post('/webhook', validateTwilioSignature, async (req, res) => {
   const { Body, From } = req.body;
+  if (!Body || !From) return res.status(400).end();
+
   const phone = From.replace('whatsapp:', '');
 
+  // Respond 200 immediately so Twilio doesn't retry
   res.status(200).end();
+
+  // Rate limit check
+  if (isRateLimited(phone)) {
+    await sendWhatsApp(phone, 'Un momento, estás enviando muchos mensajes. Intenta en un minuto. 🙏');
+    return;
+  }
 
   console.log(`[${phone}] ${Body}`);
 
