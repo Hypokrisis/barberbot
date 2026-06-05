@@ -30,20 +30,73 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-// ── Session store ─────────────────────────────────────────────────────────────
-const sessions = {};
-const SESSION_TTL = 30 * 60 * 1000;
+// ── Session store (Supabase-backed, in-memory cache) ─────────────────────────
+// Survives Railway restarts. TTL: 30 min inactivity.
+const sessions = {}; // in-memory cache: phone → session
+const SESSION_TTL = 30 * 60 * 1000; // 30 minutes
 
-function getSession(phone) {
+async function getSession(phone) {
   const now = Date.now();
-  if (sessions[phone] && now - sessions[phone].lastActivity > SESSION_TTL) {
-    delete sessions[phone];
+
+  // 1. Check warm cache
+  if (sessions[phone]) {
+    if (now - sessions[phone].lastActivity > SESSION_TTL) {
+      delete sessions[phone]; // expired in cache
+    } else {
+      sessions[phone].lastActivity = now;
+      return sessions[phone];
+    }
   }
-  if (!sessions[phone]) {
-    sessions[phone] = { state: 'idle', data: {}, history: [], lastActivity: now };
+
+  // 2. Load from Supabase
+  try {
+    const { data } = await supabase
+      .from('bot_sessions')
+      .select('state, data, history, updated_at')
+      .eq('phone', phone)
+      .maybeSingle();
+
+    if (data) {
+      const lastActivity = new Date(data.updated_at).getTime();
+      if (now - lastActivity <= SESSION_TTL) {
+        const session = {
+          state: data.state,
+          data: data.data || {},
+          history: data.history || [],
+          lastActivity: now,
+        };
+        sessions[phone] = session;
+        return session;
+      }
+    }
+  } catch (err) {
+    console.error('[Session] DB load error, using fresh session:', err.message);
   }
-  sessions[phone].lastActivity = now;
-  return sessions[phone];
+
+  // 3. New / expired session
+  const fresh = { state: 'idle', data: {}, history: [], lastActivity: now };
+  sessions[phone] = fresh;
+  return fresh;
+}
+
+async function saveSession(phone, session) {
+  session.lastActivity = Date.now();
+  sessions[phone] = session; // keep cache warm
+
+  try {
+    await supabase
+      .from('bot_sessions')
+      .upsert({
+        phone,
+        state: session.state,
+        data: session.data,
+        history: session.history || [],
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'phone' });
+  } catch (err) {
+    console.error('[Session] DB save error (non-fatal):', err.message);
+    // Non-fatal: in-memory cache still works until restart
+  }
 }
 
 // ── Date helpers ──────────────────────────────────────────────────────────────
@@ -475,7 +528,7 @@ const CANCELAR_CITA_WORDS = ['cancelar mi cita','quiero cancelar','borrar mi cit
 const RESET_FLOW_WORDS = ['cancelar','salir','exit','reset','empezar','inicio'];
 
 async function handleMessage(phone, message, businessId) {
-  const session = getSession(phone);
+  const session = await getSession(phone);
   const { business, barbers, services } = await getBusinessInfo(businessId);
   const msg = message.trim();
   const msgLower = msg.toLowerCase();
@@ -749,7 +802,9 @@ async function handleMessage(phone, message, businessId) {
     }
 
     const customerName = session.data.customerName;
-    sessions[phone] = { state: 'idle', data: {}, history: [], lastActivity: Date.now() };
+    session.state = 'idle';
+    session.data = {};
+    await saveSession(phone, session);
 
     const barber = barbers.find(b => b.id === session.data.barberId);
     const confirmMsg = `✅ *¡Cita confirmada, ${customerName}!*\n\n✂️ ${service.name}\n💈 ${barber?.name}\n📅 ${formatDate(session.data.selectedDate)} a las ${formatTime(startTime)}\n\n_Responde "cambiar mi cita" si necesitas reagendar_\n\n🔗 ${bookingLink}`;
@@ -865,6 +920,8 @@ app.post('/webhook', validateTwilioSignature, async (req, res) => {
     }
 
     const reply = await handleMessage(phone, Body, twilioSettings.business_id);
+    // Persist session after every message (write-through)
+    if (sessions[phone]) await saveSession(phone, sessions[phone]);
     await sendWhatsApp(phone, reply);
   } catch (err) {
     console.error('Webhook error:', err);
