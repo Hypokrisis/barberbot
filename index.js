@@ -508,6 +508,107 @@ async function sendProactiveReengagement() {
   }
 }
 
+// ── Recordatorios automáticos ────────────────────────────────────────────────
+async function sendReminders() {
+  try {
+    const todayStr = todayPR();
+    // mañana en PR
+    const tomorrowDate = new Date(todayStr + 'T12:00:00');
+    tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+    const tomorrowStr = tomorrowDate.toISOString().split('T')[0];
+
+    // ── Recordatorio 24h (citas de mañana no notificadas) ──────────────────
+    const { data: apt24 } = await supabase
+      .from('appointments')
+      .select(`
+        id, customer_name, customer_phone,
+        appointment_date, start_time,
+        barbers(name), services(name),
+        businesses(name, slug)
+      `)
+      .eq('appointment_date', tomorrowStr)
+      .eq('status', 'confirmed')
+      .eq('reminder_24h_sent', false)
+      .not('customer_phone', 'is', null);
+
+    for (const apt of apt24 || []) {
+      const businessName = apt.businesses?.name || 'tu barbería';
+      const barberName = apt.barbers?.name || 'el barbero';
+      const serviceName = apt.services?.name || 'tu servicio';
+      const hora = formatTime(apt.start_time);
+      const dia = formatDate(apt.appointment_date);
+
+      const msg =
+        `⏰ *Recordatorio de cita — ${businessName}*\n\n` +
+        `Hola ${apt.customer_name}, recuerda tu cita mañana:\n` +
+        `✂️ ${serviceName} con ${barberName}\n` +
+        `📅 ${dia} a las ${hora}\n\n` +
+        `Responde:\n` +
+        `✅ *CONFIRMO* — para confirmar tu asistencia\n` +
+        `❌ *CANCELAR* — para cancelar la cita`;
+
+      try {
+        await sendWhatsApp(apt.customer_phone, msg);
+        await supabase
+          .from('appointments')
+          .update({ reminder_24h_sent: true })
+          .eq('id', apt.id);
+        console.log(`[Reminder 24h] Sent to ${apt.customer_name} (${apt.customer_phone})`);
+      } catch (err) {
+        console.error(`[Reminder 24h] Failed for ${apt.customer_phone}:`, err.message);
+      }
+      await new Promise(r => setTimeout(r, 800));
+    }
+
+    // ── Recordatorio 1h (citas de hoy dentro de ~1h no notificadas) ────────
+    const nowPR = new Date(new Date().getTime() - 4 * 60 * 60 * 1000);
+    const nowMins = nowPR.getHours() * 60 + nowPR.getMinutes();
+    const windowStart = nowMins + 50;  // entre 50 y 80 minutos desde ahora
+    const windowEnd = nowMins + 80;
+
+    const { data: apt1h } = await supabase
+      .from('appointments')
+      .select(`
+        id, customer_name, customer_phone,
+        appointment_date, start_time,
+        barbers(name), businesses(name)
+      `)
+      .eq('appointment_date', todayStr)
+      .eq('status', 'confirmed')
+      .eq('reminder_30m_sent', false)
+      .not('customer_phone', 'is', null);
+
+    for (const apt of apt1h || []) {
+      const [h, m] = apt.start_time.split(':').map(Number);
+      const aptMins = h * 60 + m;
+      if (aptMins < windowStart || aptMins > windowEnd) continue;
+
+      const businessName = apt.businesses?.name || 'tu barbería';
+      const barberName = apt.barbers?.name || 'el barbero';
+
+      const msg =
+        `⏰ Tu cita es en aproximadamente 1 hora\n\n` +
+        `💈 *${businessName}* · ${formatTime(apt.start_time)}\n` +
+        `Con ${barberName}\n\n` +
+        `¡Te esperamos!`;
+
+      try {
+        await sendWhatsApp(apt.customer_phone, msg);
+        await supabase
+          .from('appointments')
+          .update({ reminder_30m_sent: true })
+          .eq('id', apt.id);
+        console.log(`[Reminder 1h] Sent to ${apt.customer_name} (${apt.customer_phone})`);
+      } catch (err) {
+        console.error(`[Reminder 1h] Failed for ${apt.customer_phone}:`, err.message);
+      }
+      await new Promise(r => setTimeout(r, 800));
+    }
+  } catch (err) {
+    console.error('[Reminders] Error:', err);
+  }
+}
+
 // ── State machine ─────────────────────────────────────────────────────────────
 const GREETINGS = new Set([
   'hola','hi','hello','buenas','hey','ola',
@@ -544,6 +645,31 @@ async function handleMessage(phone, message, businessId) {
 
   // ── IDLE ──────────────────────────────────────────────────────────────────
   if (session.state === 'idle') {
+
+    // Respuesta a recordatorio: CONFIRMO
+    if (msgLower === 'confirmo' || msgLower === 'confirmar' || msgLower === 'si confirmo') {
+      const existing = await getActiveAppointment(phone, businessId);
+      if (existing) {
+        // Ya está confirmada en DB; este es un acuse de recibo del cliente
+        const barber = barbers.find(b => b.id === existing.barber_id);
+        return `✅ ¡Perfecto, ${existing.customer_name}! Tu cita está confirmada.\n\n💈 ${barber?.name || 'Tu barbero'} te espera el ${formatDate(existing.appointment_date)} a las ${formatTime(existing.start_time)}. ¡Nos vemos! 🙌`;
+      }
+      return `No encontré una cita activa para tu número. Escribe *"cita"* para agendar una nueva.`;
+    }
+
+    // Respuesta a recordatorio: CANCELAR (la palabra completa "cancelar" sin cita en proceso)
+    if (msgLower === 'cancelar' || msgLower === 'cancelar cita') {
+      const existing = await getActiveAppointment(phone, businessId);
+      if (existing) {
+        const barber = barbers.find(b => b.id === existing.barber_id);
+        const service = services.find(s => s.id === existing.service_id);
+        session.state = 'cancel_confirm';
+        session.data.existingAppointmentId = existing.id;
+        session.data.customerName = existing.customer_name;
+        return `⚠️ ¿Seguro que quieres cancelar?\n\n✂️ ${service?.name || 'Servicio'}\n💈 ${barber?.name || 'Barbero'}\n🗓 ${formatDate(existing.appointment_date)} a las ${formatTime(existing.start_time)}\n\n1. Sí, cancelar\n2. No, mantenerla`;
+      }
+      // Sin cita activa → comportamiento de reset normal (cae abajo)
+    }
 
     // Saludo
     if (GREETINGS.has(msgLower)) {
@@ -935,6 +1061,7 @@ app.post('/admin/report', async (req, res) => {
   const { type = 'bihourly' } = req.body;
   try {
     if (type === 'closing') await sendClosingReports();
+    else if (type === 'reminders') await sendReminders();
     else await sendBiHourlyReports();
     res.json({ status: 'ok', type });
   } catch (err) {
@@ -951,6 +1078,9 @@ cron.schedule('0 0 * * *', () => sendClosingReports());
 
 // Re-engagement semanal lunes 9am PR = lunes 1pm UTC
 cron.schedule('0 13 * * 1', () => sendProactiveReengagement());
+
+// Recordatorios 24h y 1h — cada 30 minutos
+cron.schedule('*/30 * * * *', () => sendReminders());
 
 console.log('✅ Cron jobs registered');
 
