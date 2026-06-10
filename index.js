@@ -275,13 +275,22 @@ async function sendWhatsApp(to, body) {
 async function askGroq(session, message, business, services) {
   // Groq solo responde preguntas informativas. Si detecta intención de reservar,
   // redirige al flujo del bot sin procesar.
+  const toneMap = {
+    quick:   'Tono: muy breve y directo, sin saludos largos.',
+    casual:  'Tono: casual y amistoso; usa algún emoji.',
+    cool:    'Tono: relajado y juvenil, con flow boricua; usa emojis.',
+    premium: 'Tono: profesional y elegante; trato respetuoso.',
+  };
+  const tone = toneMap[business.whatsapp_bot_personality] || toneMap.quick;
+  const ownerPrompt = (business.whatsapp_bot_prompt || '').trim();
   const systemPrompt = `Eres el asistente de ${business.name} en ${business.city || 'Puerto Rico'}.
 REGLAS ESTRICTAS:
 - Responde SOLO preguntas sobre el negocio (precios, horarios, ubicación, servicios)
 - Máximo 2 líneas de respuesta
 - Si el cliente quiere agendar, cancelar o cambiar una cita: responde SOLO con "→CITA"
 - Servicios disponibles: ${services.map(s => `${s.name} $${s.price}`).join(', ')}
-- No inventes información que no esté en los datos`;
+- No inventes información que no esté en los datos
+- ${tone}${ownerPrompt ? `\n- Instrucciones del dueño: ${ownerPrompt}` : ''}`;
 
   session.history.push({ role: 'user', content: message });
   const completion = await groq.chat.completions.create({
@@ -628,12 +637,34 @@ const CANCELAR_CITA_WORDS = ['cancelar mi cita','quiero cancelar','borrar mi cit
 // Solo resetea el flujo del bot, no cancela citas en DB
 const RESET_FLOW_WORDS = ['cancelar','salir','exit','reset','empezar','inicio'];
 
+// ── Horario de atención del bot (opt-in vía whatsapp_bot_auto_schedule) ───────
+function parseHM(s) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec((s || '').trim());
+  if (!m) return null;
+  return (+m[1]) * 60 + (+m[2]);
+}
+function getOutOfHoursReply(business) {
+  if (!business || !business.whatsapp_bot_auto_schedule) return null;
+  const start = parseHM(business.whatsapp_bot_start_hour || '09:00');
+  const end   = parseHM(business.whatsapp_bot_end_hour   || '18:00');
+  if (start == null || end == null || start >= end) return null; // mal configurado → no bloquear
+  const prNow = new Date(Date.now() - 4 * 3600 * 1000); // Puerto Rico = UTC-4 (sin DST)
+  const cur = prNow.getUTCHours() * 60 + prNow.getUTCMinutes();
+  if (cur >= start && cur < end) return null; // dentro de horario
+  const link = business.whatsapp_booking_link || `https://spaceyreserve.netlify.app/book/${business.slug || ''}`;
+  return `Gracias por escribir a *${business.name}* 🌙\n\nNuestro horario de atención es de ${business.whatsapp_bot_start_hour} a ${business.whatsapp_bot_end_hour}. Te responderemos en cuanto volvamos a abrir.\n\n¿Quieres reservar en línea? 👉 ${link}`;
+}
+
 async function handleMessage(phone, message, businessId) {
   const session = await getSession(phone);
   const { business, barbers, services } = await getBusinessInfo(businessId);
   const msg = message.trim();
   const msgLower = msg.toLowerCase();
   const bookingLink = business.whatsapp_booking_link || `https://spaceyreserve.netlify.app/book/${business.slug || 'annlobarberia'}`;
+
+  // Fuera de horario: si el dueño activó el horario automático, responder y no procesar
+  const offHours = getOutOfHoursReply(business);
+  if (offHours) return offHours;
 
   // ── Reset de flujo (solo cuando está en medio de un proceso) ──────────────
   if (session.state !== 'idle' &&
