@@ -219,7 +219,13 @@ async function decideBookingReply({ session, msg, extracted, services, barbers, 
   // ── Merge LLM extraction (overwrite when present; fill name once) ──
   if (!bk.name && extracted.name) bk.name = titleCase(extracted.name);
   if (extracted.service) { const s = matchService(extracted.service, services); if (s) setService(bk, s); }
-  if (extracted.barber)  { const b = matchBarber(extracted.barber, barbers);  if (b) setBarber(bk, b); }
+  if (extracted.barber) {
+    const b = matchBarber(extracted.barber, barbers);
+    // Colisión nombre-cliente/barbero: si el "barbero" detectado es parte del nombre del
+    // cliente (ej. cliente "Loann Santiago" y barbero "Loann"), NO lo tomes como barbero.
+    const isCustomerName = b && bk.name && bk.name.toLowerCase().includes(b.name.toLowerCase());
+    if (b && !isCustomerName) setBarber(bk, b);
+  }
   if (!bk.barberId && barbers.length === 1) setBarber(bk, barbers[0]);
   if (extracted.date) { const d = resolveDateToken(extracted.date); if (d) bk.date = d; }
   if (extracted.time) { const t = normalizeTime(extracted.time); if (t) bk.time = t; }
@@ -227,6 +233,7 @@ async function decideBookingReply({ session, msg, extracted, services, barbers, 
   // ── Deterministic capture based on what we just asked (fixes the loop) ──
   if (!bk.time && awaiting.includes('time') && bk.offered) { const p = matchOffered(msg, bk.offered); if (p) bk.time = p; }
   if (!bk.name && awaiting.includes('name')) { const g = guessName(msg, services); if (g) bk.name = g; }
+  if (!bk.barberId && awaiting.includes('barber')) { const b = matchBarber(msg, barbers); if (b) setBarber(bk, b); }
   if (!bk.serviceId && awaiting.includes('service')) { const s = matchService(msg, services); if (s) setService(bk, s); }
   if (!bk.date && awaiting.includes('date')) { const d = scanDate(msg); if (d) bk.date = d; }
   if (!bk.time && awaiting.includes('time')) { const t = parseLooseTime(msg); if (t) bk.time = t; }

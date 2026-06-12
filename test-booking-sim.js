@@ -113,4 +113,16 @@ async function runDialog(title, cfg, turns) {
     ]);
   console.log(`   → cita creada: `, created[created.length - 1]);
   console.log(`   → ¿se creó 1 cita en test 4?  ${created.length - before === 1 ? 'SÍ' : 'NO'}`);
+
+  // 5) Colisión nombre-cliente/barbero: cliente "loann santiago", barbero "Loann"
+  const multiBarber = [{ id: 'b1', name: 'pepe' }, { id: 'b2', name: 'Loann' }, { id: 'b3', name: 'pablo' }];
+  await runDialog('TEST 5 — colisión nombre/barbero (NO debe auto-elegir barbero "Loann")',
+    { slots: ['09:00','15:00'], barbers: multiBarber },
+    [
+      // Groq devuelve barber='Loann' por error (es el nombre del cliente)
+      ['hola, soy loann santiago, corte hoy 3pm', { name: 'loann santiago', service: 'Corte', barber: 'Loann', date: 'tomorrow', time: '15:00' }],
+      // Debe preguntar "con cuál barbero" en vez de auto-elegir Loann; el cliente elige pepe
+      ['pepe', {}],
+      ['sí', {}],
+    ]);
 })();

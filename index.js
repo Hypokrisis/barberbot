@@ -668,7 +668,7 @@ async function extractBooking(message, services, barbers, awaiting = []) {
 {"name":string|null,"service":string|null,"barber":string|null,"date":string|null,"time":string|null}
 - name: el nombre del cliente si aparece (puede ser una sola palabra en minúscula). null si no.
 - service: SOLO si nombra un servicio de esta lista: ${svcNames}. No lo asumas. null si no lo menciona.
-- barber: el más parecido de: ${barberNames || '(ninguno)'}. null si no lo menciona.
+- barber: SOLO si el cliente pide explícitamente con quién atenderse (ej. "con Pepe"). Si un nombre aparece como el nombre del CLIENTE, no es el barbero. Lista: ${barberNames || '(ninguno)'}. null si no lo pide.
 - date: "today", "tomorrow", un día de la semana en español, o YYYY-MM-DD. null si no lo menciona.
 - time: HH:MM en 24h, ej "15:00". null si no la menciona.${askedLine}
 No inventes datos que no estén en el mensaje.`;
