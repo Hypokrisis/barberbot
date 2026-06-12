@@ -1120,7 +1120,7 @@ app.post('/webhook', validateTwilioSignature, async (req, res) => {
   }
 });
 
-app.get('/health', (_, res) => res.json({ status: 'ok', version: '2.1.0' }));
+app.get('/health', (_, res) => res.json({ status: 'ok', version: '2.2.0-slotfill' }));
 
 app.post('/admin/report', async (req, res) => {
   const { type = 'bihourly' } = req.body;
@@ -1152,7 +1152,7 @@ console.log('✅ Cron jobs registered');
 // ── Server ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
-  console.log('✅ BarberBot v2.1.0 started');
+  console.log('✅ BarberBot v2.2.0-slotfill started');
   console.log(`🚀 Server running on port ${PORT}`);
 });
 
