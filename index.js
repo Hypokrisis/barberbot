@@ -8,6 +8,7 @@ const { createClient } = require('@supabase/supabase-js');
 const twilio = require('twilio');
 const Groq = require('groq-sdk');
 const cron = require('node-cron');
+const bookingLogic = require('./booking-logic');
 
 // ── Environment validation ───────────────────────────────────────────────────
 const requiredEnvVars = [
@@ -655,6 +656,59 @@ function getOutOfHoursReply(business) {
   return `Gracias por escribir a *${business.name}* 🌙\n\nNuestro horario de atención es de ${business.whatsapp_bot_start_hour} a ${business.whatsapp_bot_end_hour}. Te responderemos en cuanto volvamos a abrir.\n\n¿Quieres reservar en línea? 👉 ${link}`;
 }
 
+// ── Slot-filling: LLM extractor (free-form → structured) ──────────────────────
+async function extractBooking(message, services, barbers) {
+  const svcNames = services.map(s => s.name).join(', ');
+  const barberNames = barbers.map(b => b.name).join(', ');
+  const sys = `Extrae datos de una solicitud de cita de barbería. Devuelve SOLO un objeto JSON:
+{"name":string|null,"service":string|null,"barber":string|null,"date":string|null,"time":string|null}
+- service: el más parecido de: ${svcNames}
+- barber: el más parecido de: ${barberNames || '(ninguno)'} (null si no lo menciona)
+- date: "today", "tomorrow", un día de la semana en español, o YYYY-MM-DD (null si no lo menciona)
+- time: HH:MM en 24h, ej "15:00" (null si no la menciona)
+- name: el nombre del cliente (null si no lo dice)
+No inventes nada que no esté en el mensaje.`;
+  try {
+    const c = await groq.chat.completions.create({
+      model: 'llama-3.1-8b-instant',
+      messages: [{ role: 'system', content: sys }, { role: 'user', content: message }],
+      temperature: 0,
+      max_tokens: 150,
+      response_format: { type: 'json_object' },
+    });
+    return JSON.parse(c.choices[0].message.content) || {};
+  } catch (e) {
+    console.error('[extractBooking] failed:', e.message);
+    return {};
+  }
+}
+
+// Evita el mensaje duplicado: durante la conversación responde SOLO el bot, así
+// que borramos el job de template que el trigger encoló (created/cancelled/rescheduled).
+// Las reservas web/dashboard no pasan por aquí, así que conservan su template.
+async function suppressBotTemplate(appointmentId, eventType) {
+  if (!appointmentId) return;
+  try {
+    await supabase.from('notification_jobs')
+      .delete()
+      .eq('appointment_id', appointmentId)
+      .eq('event_type', eventType)
+      .in('status', ['pending', 'processing']);
+  } catch (e) {
+    console.error('[suppressBotTemplate] failed:', e.message);
+  }
+}
+
+// Toque ligero de personalidad para los mensajes ancla (apertura y confirmación final)
+function botVibe(business) {
+  switch (business?.whatsapp_bot_personality) {
+    case 'cool':    return { open: '¡Qué lo qué! 💈', ok: '¡Brutal' };
+    case 'casual':  return { open: '¡Saludos! 💈',   ok: '¡Listo' };
+    case 'premium': return { open: 'Bienvenido 💈',  ok: 'Confirmado' };
+    default:        return { open: '¡Saludos! 💈',   ok: '¡Listo' }; // quick
+  }
+}
+
 async function handleMessage(phone, message, businessId) {
   const session = await getSession(phone);
   const { business, barbers, services } = await getBusinessInfo(businessId);
@@ -739,10 +793,18 @@ async function handleMessage(phone, message, businessId) {
       return `⚠️ ¿Seguro que quieres cancelar?\n\n✂️ ${service?.name || 'Servicio'}\n💈 ${barber?.name || 'Barbero'}\n🗓 ${formatDate(existing.appointment_date)} a las ${formatTime(existing.start_time)}\n\n1. Sí, cancelar\n2. No, mantenerla`;
     }
 
-    // Iniciar booking
+    // Iniciar booking (slot-filling: pide todo de una vez)
     if (BOOKING_WORDS.some(w => msgLower.includes(w))) {
-      session.state = 'name';
-      return `¡Perfecto! 💈 ¿Cuál es tu nombre?`;
+      session.state = 'booking';
+      session.data.bk = {};
+      // El primer mensaje puede traer datos ("quiero cita, soy Carlos, corte mañana 3pm")
+      const extracted = await extractBooking(msg, services, barbers);
+      if (extracted && (extracted.name || extracted.service || extracted.date || extracted.time)) {
+        return await bookingLogic.decideBookingReply({ session, msg, extracted, services, barbers, getSlots: getAvailableSlots });
+      }
+      const svcLine = services.map(s => `${s.name} $${s.price}`).join(' / ');
+      const v = botVibe(business);
+      return `${v.open} Para tu cita mándame en *un solo mensaje*: tu nombre, el servicio (${svcLine}) y el día y hora que prefieres.`;
     }
 
     // Pro/Premium: Groq para preguntas generales
@@ -837,16 +899,20 @@ async function handleMessage(phone, message, businessId) {
       return `Error al reagendar. Intenta de nuevo o escribe *"cita"* para una nueva.`;
     }
 
+    // El bot ya confirma aquí → borra el template duplicado del trigger
+    await suppressBotTemplate(apptId, 'rescheduled');
+
     return `✅ *¡Cita reagendada, ${customerName}!*\n\n✂️ ${service?.name || 'Servicio'}\n💈 ${barber?.name || 'Barbero'}\n📅 ${formatDate(newDate)} a las ${formatTime(startTime)}\n\n¡Te esperamos! 💈`;
   }
 
   // ── CANCEL CONFIRM ────────────────────────────────────────────────────────
   if (session.state === 'cancel_confirm') {
     if (msg === '1' || msgLower.includes('sí') || msgLower === 'si') {
+      const apptId = session.data.existingAppointmentId;
       const { error } = await supabase
         .from('appointments')
         .update({ status: 'cancelled' })
-        .eq('id', session.data.existingAppointmentId);
+        .eq('id', apptId);
 
       session.state = 'idle';
       const name = session.data.customerName;
@@ -855,6 +921,8 @@ async function handleMessage(phone, message, businessId) {
       if (error) {
         return `Error al cancelar. Contáctanos directamente.`;
       }
+      // El bot ya confirma aquí → borra el template duplicado del trigger
+      await suppressBotTemplate(apptId, 'cancelled');
       return `Cita cancelada, ${name}. Si cambias de opinión escribe *"cita"* para agendar de nuevo. ¡Hasta pronto! 👋`;
     } else {
       session.state = 'idle';
@@ -863,125 +931,71 @@ async function handleMessage(phone, message, businessId) {
     }
   }
 
-  // ── NAME ──────────────────────────────────────────────────────────────────
-  if (session.state === 'name') {
-    if (msg.length < 2) return `Por favor dime tu nombre.`;
-    session.data.customerName = msg;
-    const list = services.map((s, i) => `${i+1}. ${s.name} — $${s.price} (${s.duration_minutes} min)`).join('\n');
-    session.state = 'service';
-    return `¡Hola, ${session.data.customerName}! 👋\n\n¿Qué servicio deseas?\n${list}`;
-  }
-
-  // ── SERVICE ───────────────────────────────────────────────────────────────
-  if (session.state === 'service') {
-    const num = parseInt(msg) - 1;
-    if (isNaN(num) || num < 0 || num >= services.length) {
-      const list = services.map((s, i) => `${i+1}. ${s.name} — $${s.price}`).join('\n');
-      return `Elige un número del 1 al ${services.length}:\n${list}`;
-    }
-    session.data.service = services[num];
-    const list = barbers.map((b, i) => `${i+1}. ${b.name}`).join('\n');
-    session.state = 'barber';
-    return `*${session.data.service.name}* ✓\n\n¿Con quién prefieres?\n${list}\n${barbers.length + 1}. Cualquiera disponible`;
-  }
-
-  // ── BARBER ────────────────────────────────────────────────────────────────
-  if (session.state === 'barber') {
-    const num = parseInt(msg) - 1;
-    if (isNaN(num) || num < 0 || num > barbers.length) {
-      const list = barbers.map((b, i) => `${i+1}. ${b.name}`).join('\n');
-      return `Elige un número:\n${list}\n${barbers.length + 1}. Cualquiera disponible`;
-    }
-    const selectedBarber = num === barbers.length ? barbers[0] : barbers[num];
-    session.data.barberId = selectedBarber.id;
-    session.data.barberName = selectedBarber.name;
-
-    const days = await getNextAvailableDays(session.data.barberId, 5);
-    if (days.length === 0) {
-      session.state = 'idle';
-      return `No hay fechas disponibles en los próximos 30 días. Contáctanos directamente.`;
-    }
-    session.data.availableDays = days;
-    const list = days.map((d, i) => `${i+1}. ${formatDate(d.date)}`).join('\n');
-    session.state = 'date';
-    return `*${session.data.barberName}* ✓\n\nFechas disponibles:\n${list}`;
-  }
-
-  // ── DATE ──────────────────────────────────────────────────────────────────
-  if (session.state === 'date') {
-    const num = parseInt(msg) - 1;
-    const days = session.data.availableDays;
-    if (isNaN(num) || num < 0 || num >= days.length) {
-      const list = days.map((d, i) => `${i+1}. ${formatDate(d.date)}`).join('\n');
-      return `Elige un número:\n${list}`;
-    }
-    session.data.selectedDate = days[num].date;
-    const slots = await getAvailableSlots(session.data.barberId, session.data.selectedDate);
-    if (slots.length === 0) {
-      const list = days.map((d, i) => `${i+1}. ${formatDate(d.date)}`).join('\n');
-      return `Sin horarios para esa fecha. Elige otra:\n${list}`;
-    }
-    session.data.availableSlots = slots;
-    const list = slots.map((s, i) => `${i+1}. ${formatTime(s)}`).join('\n');
-    session.state = 'slot';
-    return `*${formatDate(session.data.selectedDate)}* ✓\n\nHorarios disponibles:\n${list}`;
-  }
-
-  // ── SLOT ──────────────────────────────────────────────────────────────────
-  if (session.state === 'slot') {
-    const num = parseInt(msg) - 1;
-    const slots = session.data.availableSlots;
-    if (isNaN(num) || num < 0 || num >= slots.length) {
-      const list = slots.map((s, i) => `${i+1}. ${formatTime(s)}`).join('\n');
-      return `Elige un número:\n${list}`;
-    }
-
-    const startTime = slots[num];
-    const service = session.data.service;
-    const [h, m] = startTime.split(':').map(Number);
-    const endMin = h * 60 + m + (service.duration_minutes || 30);
-    const endTime = `${String(Math.floor(endMin/60)).padStart(2,'0')}:${String(endMin%60).padStart(2,'0')}`;
-
-    const { error, isGuest } = await createAppointment({
-      businessId,
-      barberId: session.data.barberId,
-      serviceId: service.id,
-      customerName: session.data.customerName,
-      customerPhone: phone,
-      date: session.data.selectedDate,
-      startTime,
-      endTime
+  // ── BOOKING (slot-filling: extrae todo del mensaje libre) ─────────────────
+  if (session.state === 'booking') {
+    const extracted = await extractBooking(msg, services, barbers);
+    return await bookingLogic.decideBookingReply({
+      session, msg, extracted, services, barbers, getSlots: getAvailableSlots,
     });
+  }
 
-    if (error) {
-      console.error('Appointment error:', error);
-      return `Error al crear la cita. Por favor intenta de nuevo.`;
+  // ── CONFIRM (un solo mensaje de resumen → sí/no) ──────────────────────────
+  if (session.state === 'confirm') {
+    // Normaliza acentos para que "sí" cuente como "si" (\b no reconoce la í)
+    const norm = msgLower.replace(/[áàä]/g,'a').replace(/[éèë]/g,'e').replace(/[íìï]/g,'i').replace(/[óòö]/g,'o').replace(/[úùü]/g,'u');
+    const yes = msg === '1' || /^(si|dale|ok|oka|confirmo|claro|correcto|listo|va)\b/.test(norm);
+    const no  = msg === '2' || /^(no|cambiar|cambia|espera|mejor)\b/.test(norm);
+
+    if (yes) {
+      const bk = session.data.bk || {};
+      const [bh, bm] = bk.time.split(':').map(Number);
+      const endMin = bh * 60 + bm + (bk.serviceDuration || 30);
+      const endTime = `${String(Math.floor(endMin/60)).padStart(2,'0')}:${String(endMin%60).padStart(2,'0')}`;
+
+      const { appt, error, isGuest } = await createAppointment({
+        businessId,
+        barberId: bk.barberId,
+        serviceId: bk.serviceId,
+        customerName: bk.name,
+        customerPhone: phone,
+        date: bk.date,
+        startTime: bk.time,
+        endTime,
+      });
+
+      if (error) {
+        console.error('Appointment error:', error);
+        session.state = 'idle';
+        session.data = {};
+        return `Uy, no pude guardar la cita 😕 Intenta de nuevo en un momento.`;
+      }
+
+      // El bot ya confirma aquí → borra el template duplicado que encoló el trigger
+      await suppressBotTemplate(appt.id, 'created');
+
+      const v = botVibe(business);
+      const reply = `✅ ${v.ok}, ${bk.name}! Te esperamos el ${formatDate(bk.date)} a las ${formatTime(bk.time)}. 💈`;
+
+      // Invitado: 1 mensaje corto opcional de conversión a cuenta (fuera del flujo)
+      if (isGuest) {
+        const registerLink = `https://spaceyreserve.netlify.app/register?phone=${encodeURIComponent(phone)}`;
+        setTimeout(async () => {
+          try { await sendWhatsApp(phone, `💡 Crea tu cuenta gratis para ver y reagendar tus citas: ${registerLink}`); }
+          catch (err) { console.error('[Conversion]', err.message); }
+        }, 4000);
+      }
+
+      session.state = 'idle';
+      session.data = {};
+      return reply;
     }
 
-    const customerName = session.data.customerName;
-    session.state = 'idle';
-    session.data = {};
-    await saveSession(phone, session);
-
-    const barber = barbers.find(b => b.id === session.data.barberId);
-    const confirmMsg = `✅ *¡Cita confirmada, ${customerName}!*\n\n✂️ ${service.name}\n💈 ${barber?.name}\n📅 ${formatDate(session.data.selectedDate)} a las ${formatTime(startTime)}\n\n_Responde "cambiar mi cita" si necesitas reagendar_\n\n🔗 ${bookingLink}`;
-
-    // Para invitados: enviar mensaje de conversión 3 segundos después
-    if (isGuest) {
-      const encodedPhone = encodeURIComponent(phone);
-      const registerLink = `https://spaceyreserve.netlify.app/register?phone=${encodedPhone}`;
-      setTimeout(async () => {
-        try {
-          await sendWhatsApp(phone,
-            `💡 *¿Sabías que puedes crear una cuenta gratis?*\n\nCon tu cuenta en Spacey Reserve puedes:\n✅ Ver el historial de tus citas\n✅ Reagendar desde la web\n✅ Recibir ofertas exclusivas\n✅ Acumular visitas y ser VIP\n\n🔗 ${registerLink}`
-          );
-        } catch (err) {
-          console.error('[Conversion] Error sending guest conversion message:', err.message);
-        }
-      }, 4000);
+    if (no) {
+      session.state = 'booking';
+      return `Claro, dime el dato correcto (servicio, día u hora) 🙂`;
     }
 
-    return confirmMsg;
+    return `¿Confirmo la cita? Responde *sí* o *no*.`;
   }
 
   // Fallback
