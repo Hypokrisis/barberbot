@@ -204,6 +204,39 @@ function looksLikeBooking(msg, services) {
   return false;
 }
 
+// "con pepe" / "con el barbero pepe" → barbero EXPLÍCITO
+function barberFromCon(msg, barbers) {
+  const mt = /\bcon\s+(?:el\s+|la\s+)?(?:barber[oa]\s+)?([a-záéíóúñ]+)/i.exec(String(msg));
+  if (!mt) return null;
+  return matchBarber(mt[1], barbers);
+}
+
+// "soy X" / "me llamo X" / "mi nombre es X" → nombre del CLIENTE (1-2 palabras)
+function clientNameFromSoy(msg, services) {
+  const mt = /\b(?:soy|me llamo|mi nombre es)\s+(.+)/i.exec(String(msg));
+  if (!mt) return null;
+  const after = mt[1].replace(/[.,!¡¿?].*$/, ' ');
+  const stop = new Set(['con','quiero','para','el','la','un','una','y','a','las','de','hoy','mañana','manana','lunes','martes','miercoles','miércoles','jueves','viernes','sabado','sábado','domingo']);
+  const out = [];
+  for (const w of after.toLowerCase().split(/\s+/).filter(Boolean)) {
+    if (/\d/.test(w) || stop.has(w)) break;
+    if (services.some(s => s.name.toLowerCase().split(/\s+/).includes(w))) break;
+    out.push(w);
+    if (out.length >= 2) break;
+  }
+  return out.length ? out.join(' ') : null;
+}
+
+// Una palabra suelta que coincide EXACTO con el nombre de un barbero (posible colisión)
+function looseBarberMatch(msg, barbers) {
+  for (const w of String(msg).toLowerCase().replace(/[.,!¡¿?]/g, ' ').split(/\s+/).filter(Boolean)) {
+    if (/\d/.test(w)) continue;
+    const b = barbers.find(bb => bb.name.toLowerCase() === w);
+    if (b) return b;
+  }
+  return null;
+}
+
 const WANTS_LIST = /(qu[eé] tienes|disponible|opciones|horarios|que hay|disponibilidad)/i;
 
 /**
@@ -216,27 +249,59 @@ async function decideBookingReply({ session, msg, extracted, services, barbers, 
   const awaiting = session.data.awaiting || [];
   extracted = extracted || {};
 
-  // ── Merge LLM extraction (overwrite when present; fill name once) ──
-  if (!bk.name && extracted.name) bk.name = titleCase(extracted.name);
-  if (extracted.service) { const s = matchService(extracted.service, services); if (s) setService(bk, s); }
-  if (extracted.barber) {
-    const b = matchBarber(extracted.barber, barbers);
-    // Colisión nombre-cliente/barbero: si el "barbero" detectado es parte del nombre del
-    // cliente (ej. cliente "Loann Santiago" y barbero "Loann"), NO lo tomes como barbero.
-    const isCustomerName = b && bk.name && bk.name.toLowerCase().includes(b.name.toLowerCase());
-    if (b && !isCustomerName) setBarber(bk, b);
+  // ── Respuesta a una desambiguación pendiente (cliente vs barbero) ──
+  if (awaiting.includes('__disambig__')) {
+    const nm = session.data.disambig || '';
+    delete session.data.disambig;
+    session.data.awaiting = [];
+    if (/(barber|con\b|la cita)/i.test(msg)) { const b = matchBarber(nm, barbers); if (b) setBarber(bk, b); }
+    else { bk.name = titleCase(nm); } // por defecto es el cliente (regla 1)
   }
-  if (!bk.barberId && barbers.length === 1) setBarber(bk, barbers[0]);
+
+  // ── Servicio / fecha / hora (no colisionan con nombres) ──
+  if (extracted.service) { const s = matchService(extracted.service, services); if (s) setService(bk, s); }
   if (extracted.date) { const d = resolveDateToken(extracted.date); if (d) bk.date = d; }
   if (extracted.time) { const t = normalizeTime(extracted.time); if (t) bk.time = t; }
-
-  // ── Deterministic capture based on what we just asked (fixes the loop) ──
   if (!bk.time && awaiting.includes('time') && bk.offered) { const p = matchOffered(msg, bk.offered); if (p) bk.time = p; }
-  if (!bk.name && awaiting.includes('name')) { const g = guessName(msg, services); if (g) bk.name = g; }
-  if (!bk.barberId && awaiting.includes('barber')) { const b = matchBarber(msg, barbers); if (b) setBarber(bk, b); }
-  if (!bk.serviceId && awaiting.includes('service')) { const s = matchService(msg, services); if (s) setService(bk, s); }
   if (!bk.date && awaiting.includes('date')) { const d = scanDate(msg); if (d) bk.date = d; }
   if (!bk.time && awaiting.includes('time')) { const t = parseLooseTime(msg); if (t) bk.time = t; }
+  if (!bk.serviceId && awaiting.includes('service')) { const s = matchService(msg, services); if (s) setService(bk, s); }
+
+  // ── NOMBRE y BARBERO por contexto — nunca confundir uno con el otro ──
+  const conBarber = barberFromCon(msg, barbers);       // "con X"  → barbero
+  const soyName   = clientNameFromSoy(msg, services);  // "soy X"  → cliente
+
+  // Barbero: explícito "con X", o respuesta directa a "¿con cuál barbero?"
+  if (!bk.barberId) {
+    if (conBarber) setBarber(bk, conBarber);
+    else if (awaiting.includes('barber') && !awaiting.includes('name')) { const b = matchBarber(msg, barbers); if (b) setBarber(bk, b); }
+  }
+  // Cliente: explícito "soy X", o respuesta directa a "¿tu nombre?" (aunque coincida con un barbero)
+  if (!bk.name) {
+    if (soyName) bk.name = titleCase(soyName);
+    else if (awaiting.includes('name')) { const g = guessName(msg, services); if (g) bk.name = g; }
+  }
+  // Fallbacks del LLM, solo si NO chocan con el otro rol
+  if (!bk.name && extracted.name && !matchBarber(extracted.name, barbers)) bk.name = titleCase(extracted.name);
+  if (!bk.barberId && !conBarber && extracted.barber && !awaiting.includes('name')) {
+    const b = matchBarber(extracted.barber, barbers);
+    const collides = b && ((soyName && soyName.toLowerCase().includes(b.name.toLowerCase())) ||
+                           (bk.name && bk.name.toLowerCase().includes(b.name.toLowerCase())));
+    if (b && !collides) setBarber(bk, b);
+  }
+  // Un solo barbero → asignar siempre, sin preguntar
+  if (!bk.barberId && barbers.length === 1) setBarber(bk, barbers[0]);
+
+  // ── Ambigüedad real: una palabra = nombre de barbero, sin "soy"/"con", y aún no
+  //    sabemos ni cliente ni barbero → preguntar UNA sola vez (nunca asumir en silencio) ──
+  if (!bk.name && !bk.barberId && !soyName && !conBarber && barbers.length > 1 && !awaiting.includes('name')) {
+    const collide = looseBarberMatch(msg, barbers);
+    if (collide) {
+      session.data.awaiting = ['__disambig__'];
+      session.data.disambig = collide.name;
+      return `¿${collide.name} es tu nombre, o quieres la cita con el barbero ${collide.name}? 🙂`;
+    }
+  }
 
   // ── Client explicitly asked to see options ──
   if (WANTS_LIST.test(msg) && bk.serviceId && bk.barberId && bk.date && !bk.time) {
