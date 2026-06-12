@@ -237,14 +237,57 @@ function looseBarberMatch(msg, barbers) {
   return null;
 }
 
-const WANTS_LIST = /(qu[eé] tienes|disponible|opciones|horarios|que hay|disponibilidad)/i;
+function dayLabel(dateStr) {
+  const today = todayPR();
+  if (dateStr === today) return 'hoy';
+  const t = new Date(today + 'T12:00:00'); t.setDate(t.getDate() + 1);
+  if (dateStr === t.toISOString().split('T')[0]) return 'mañana';
+  const days = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
+  return 'el ' + days[new Date(dateStr + 'T12:00:00').getDay()];
+}
+
+function serviceInText(msg, services) {
+  const m = String(msg).toLowerCase();
+  return services.find(s => m.includes(s.name.toLowerCase()))
+      || services.find(s => m.includes(s.name.toLowerCase().split(/\s+/)[0]))
+      || null;
+}
+
+// Empareja la respuesta del cliente con los slots ofrecidos [{date,time}] (multi-día)
+function matchOfferedSlot(msg, offered) {
+  if (!offered || !offered.length) return null;
+  const m = String(msg).toLowerCase().trim();
+  if (m === '1' || /primer/.test(m)) return offered[0] || null;
+  if (m === '2' || /segund/.test(m)) return offered[1] || null;
+  if (m === '3' || /tercer/.test(m)) return offered[2] || null;
+  const day = scanDate(m);
+  const t = parseLooseTime(m);
+  const cands = day ? offered.filter(o => o.date === day) : offered.slice();
+  if (t) {
+    const [th, tm] = t.split(':').map(Number);
+    let hit = cands.find(o => o.time === t)
+           || cands.find(o => { const [oh, om] = o.time.split(':').map(Number); return (oh % 12 || 12) === (th % 12 || 12) && om === tm; });
+    if (hit) return hit;
+  }
+  const bare = /(?:^|\s|las\s)(\d{1,2})(?:\s|$|pm|am)/.exec(m);
+  if (bare) {
+    const h = +bare[1];
+    const hit = cands.find(o => { const oh = +o.time.split(':')[0]; return (oh % 12 || 12) === (h % 12 || 12) || oh === h; });
+    if (hit) return hit;
+  }
+  if (day && cands.length === 1) return cands[0];
+  return null;
+}
+
+const PRICE_Q = /(precio|cuesta|cuestan|cu[aá]nto\s+(cuesta|vale|sale|es|son))/i;
+const AVAIL_Q = /(qu[eé]\s+(d[ií]as?|horarios?|hora|tiempo)|cu[aá]ndo|disponib|qu[eé]\s+tienes|espacios?|cupos?)/i;
 
 /**
  * Core slot-filling step. Mutates `session.data.bk`, `session.data.awaiting`,
  * and `session.state`. `extracted` is the LLM JSON (any/all fields may be null).
  * `getSlots(barberId, date)` → Promise<string[]> of free 'HH:MM' slots.
  */
-async function decideBookingReply({ session, msg, extracted, services, barbers, getSlots }) {
+async function decideBookingReply({ session, msg, extracted, services, barbers, getSlots, getUpcoming }) {
   const bk = session.data.bk || (session.data.bk = {});
   const awaiting = session.data.awaiting || [];
   extracted = extracted || {};
@@ -262,20 +305,17 @@ async function decideBookingReply({ session, msg, extracted, services, barbers, 
   if (extracted.service) { const s = matchService(extracted.service, services); if (s) setService(bk, s); }
   if (extracted.date) { const d = resolveDateToken(extracted.date); if (d) bk.date = d; }
   if (extracted.time) { const t = normalizeTime(extracted.time); if (t) bk.time = t; }
-  if (!bk.time && awaiting.includes('time') && bk.offered) { const p = matchOffered(msg, bk.offered); if (p) bk.time = p; }
-  if (!bk.date && awaiting.includes('date')) { const d = scanDate(msg); if (d) bk.date = d; }
-  if (!bk.time && awaiting.includes('time')) { const t = parseLooseTime(msg); if (t) bk.time = t; }
+  if (!bk.date) { const d = scanDate(msg); if (d) bk.date = d; }
+  if (!bk.time) { const t = parseLooseTime(msg); if (t) bk.time = t; }
   if (!bk.serviceId && awaiting.includes('service')) { const s = matchService(msg, services); if (s) setService(bk, s); }
 
   // ── NOMBRE y BARBERO por contexto — nunca confundir uno con el otro ──
   const conBarber = barberFromCon(msg, barbers);       // "con X"  → barbero
   const soyName   = clientNameFromSoy(msg, services);  // "soy X"  → cliente
 
-  // Barbero: explícito "con X", o respuesta directa a "¿con cuál barbero?"
-  if (!bk.barberId) {
-    if (conBarber) setBarber(bk, conBarber);
-    else if (awaiting.includes('barber') && !awaiting.includes('name')) { const b = matchBarber(msg, barbers); if (b) setBarber(bk, b); }
-  }
+  // Barbero: "con X" siempre manda (permite cambiar); o respuesta directa a "¿con cuál barbero?"
+  if (conBarber) setBarber(bk, conBarber);
+  else if (!bk.barberId && awaiting.includes('barber') && !awaiting.includes('name')) { const b = matchBarber(msg, barbers); if (b) setBarber(bk, b); }
   // Cliente: explícito "soy X", o respuesta directa a "¿tu nombre?" (aunque coincida con un barbero)
   if (!bk.name) {
     if (soyName) bk.name = titleCase(soyName);
@@ -294,61 +334,108 @@ async function decideBookingReply({ session, msg, extracted, services, barbers, 
 
   // ── Ambigüedad real: una palabra = nombre de barbero, sin "soy"/"con", y aún no
   //    sabemos ni cliente ni barbero → preguntar UNA sola vez (nunca asumir en silencio) ──
-  if (!bk.name && !bk.barberId && !soyName && !conBarber && barbers.length > 1 && !awaiting.includes('name')) {
+  if (!bk.name && !bk.barberId && !soyName && !conBarber && barbers.length > 1 && !awaiting.includes('name')
+      && !AVAIL_Q.test(msg) && !PRICE_Q.test(msg)) {
     const collide = looseBarberMatch(msg, barbers);
     if (collide) {
       session.data.awaiting = ['__disambig__'];
       session.data.disambig = collide.name;
-      return `¿${collide.name} es tu nombre, o quieres la cita con el barbero ${collide.name}? 🙂`;
+      session.data.lastReply = `¿${collide.name} es tu nombre, o quieres la cita con el barbero ${collide.name}? 🙂`;
+      return session.data.lastReply;
     }
   }
 
-  // ── Client explicitly asked to see options ──
-  if (WANTS_LIST.test(msg) && bk.serviceId && bk.barberId && bk.date && !bk.time) {
-    const slots = await getSlots(bk.barberId, bk.date);
-    if (slots && slots.length) {
-      bk.offered = spreadSlots(slots, 5);
-      session.data.awaiting = ['time'];
-      return `Para el ${formatDate(bk.date)} tengo: ${bk.offered.map(formatTime).join(', ')}. ¿Cuál prefieres?`;
+  // ── Empareja la respuesta con los slots ofrecidos (multi-día) ──
+  if (bk.offeredSlots && (awaiting.includes('date') || awaiting.includes('time'))) {
+    const pick = matchOfferedSlot(msg, bk.offeredSlots);
+    if (pick) { bk.date = pick.date; bk.time = pick.time; }
+  }
+
+  // Pide CHOICES (nombre/servicio/barbero); para día/hora OFRECE disponibilidad real.
+  async function nextStep() {
+    const choices = [];
+    if (!bk.name) choices.push(['name', 'tu nombre']);
+    if (!bk.serviceId) choices.push(['service', 'el servicio']);
+    if (!bk.barberId && barbers.length > 1) choices.push(['barber', 'con cuál barbero']);
+    if (choices.length) {
+      session.data.awaiting = choices.map(c => c[0]);
+      delete bk.offeredSlots;
+      let extra = '';
+      if (!bk.serviceId) extra += '\n' + services.map(s => `• ${s.name} $${s.price}`).join('\n');
+      if (!bk.barberId && barbers.length > 1) extra += '\n💈 ' + barbers.map(b => b.name).join(', ');
+      return `Me falta ${joinNatural(choices.map(c => c[1]))} 🙂${extra}`;
     }
+    if (!bk.barberId && barbers.length === 1) setBarber(bk, barbers[0]);
+    if (bk.date && bk.time) {
+      const slots = await getSlots(bk.barberId, bk.date);
+      if (slots && slots.includes(bk.time)) {
+        session.state = 'confirm'; session.data.awaiting = []; delete bk.offeredSlots;
+        return bookingSummary(bk);
+      }
+    }
+    return await offerStep(); // FALLO 3: el bot OFRECE, no pide
   }
 
-  // ── Ask for everything still missing, together, in ONE message ──
-  const missing = [];
-  if (!bk.name) missing.push(['name', 'tu nombre']);
-  if (!bk.serviceId) missing.push(['service', 'el servicio']);
-  if (!bk.barberId && barbers.length > 1) missing.push(['barber', 'con cuál barbero']);
-  if (!bk.date) missing.push(['date', 'el día']);
-  if (!bk.time) missing.push(['time', 'a qué hora']);
-  if (missing.length) {
-    session.data.awaiting = missing.map(x => x[0]);
-    delete bk.offered;
-    let extra = '';
-    if (!bk.serviceId) extra += '\n' + services.map(s => `• ${s.name} $${s.price}`).join('\n');
-    if (!bk.barberId && barbers.length > 1) extra += '\n💈 ' + barbers.map(b => b.name).join(', ');
-    return `Me falta ${joinNatural(missing.map(x => x[1]))} 🙂${extra}`;
+  async function offerStep() {
+    let groups = null;
+    if (bk.date) {
+      const slots = await getSlots(bk.barberId, bk.date);
+      if (bk.time && slots && !slots.includes(bk.time)) {
+        const near = nearestSlots(slots, bk.time, 3); bk.time = null;
+        if (near.length) groups = [{ date: bk.date, slots: near }];
+      }
+      if (!groups && slots && slots.length) groups = [{ date: bk.date, slots: spreadSlots(slots, 3) }];
+      if (!groups) bk.date = null; // ese día no tiene → ofrece próximos
+    }
+    if (!groups) {
+      const up = getUpcoming ? await getUpcoming(bk.barberId) : [];
+      if (!up || !up.length) {
+        const nm = bk.barberName; bk.barberId = null; bk.barberName = null; delete bk.offeredSlots;
+        session.data.awaiting = ['barber'];
+        return `${nm} no tiene espacios próximos 😕 ¿Lo intentamos con otro? 💈 ${barbers.map(b => b.name).join(', ')}`;
+      }
+      groups = up;
+    }
+    const offered = []; const parts = [];
+    for (const g of groups) {
+      for (const t of g.slots) offered.push({ date: g.date, time: t });
+      parts.push(`${dayLabel(g.date)} a las ${joinNatural(g.slots.map(formatTime), 'o')}`);
+    }
+    bk.offeredSlots = offered;
+    session.data.awaiting = ['date', 'time'];
+    return `${bk.barberName} tiene ${joinNatural(parts, 'y')}. ¿Cuál te queda bien? 🙂`;
   }
 
-  // ── Everything gathered → availability ──
-  session.data.awaiting = [];
-  const slots = await getSlots(bk.barberId, bk.date);
-  if (!slots || slots.length === 0) {
-    bk.date = null; bk.time = null; delete bk.offered;
-    session.data.awaiting = ['date'];
-    return `Uy, no tengo horarios ese día 😕 ¿Qué otro día te sirve?`;
+  let out;
+  if (PRICE_Q.test(msg)) {
+    const s = serviceInText(msg, services);
+    const pre = s ? `El ${s.name} cuesta $${s.price}. ` : `Precios: ${services.map(x => `${x.name} $${x.price}`).join(', ')}.\n`;
+    out = pre + await nextStep();
+  } else if (AVAIL_Q.test(msg)) {
+    // En una pregunta de disponibilidad, un nombre = barbero (no el cliente)
+    if (!bk.barberId) { const qb = barberFromCon(msg, barbers) || looseBarberMatch(msg, barbers); if (qb) setBarber(bk, qb); }
+    const qd = scanDate(msg); if (qd) bk.date = qd;
+    if (bk.barberId) {
+      out = await offerStep();
+    } else if (bk.serviceId && barbers.length > 1) {
+      // Reconoce la pregunta: pide el barbero y promete los horarios
+      session.data.awaiting = ['barber'];
+      out = `¿Con cuál barbero? 💈 ${barbers.map(b => b.name).join(', ')} — y te digo sus horarios 🙂`;
+    } else {
+      out = await nextStep();
+    }
+  } else {
+    out = await nextStep();
+    // Anti-loop (FALLO 2): si repetiría lo mismo y ya hay barbero+servicio → ofrece concreto
+    if (out === session.data.lastReply && bk.barberId && bk.serviceId) out = await offerStep();
   }
-  if (slots.includes(bk.time)) {
-    delete bk.offered;
-    session.state = 'confirm';
-    return bookingSummary(bk);
+  // Garantía final: nunca un mensaje idéntico al anterior (FALLO 2)
+  if (out === session.data.lastReply) {
+    out = out.replace('¿Cuál te queda bien? 🙂', '¿Cuál de esos te sirve? 🙂');
+    if (out === session.data.lastReply) out = 'Como te dije: ' + out.charAt(0).toLowerCase() + out.slice(1);
   }
-  // Requested time taken → offer 2-3 nearest (never the whole list)
-  const reqTime = bk.time; bk.time = null;
-  const near = nearestSlots(slots, reqTime, 3);
-  bk.offered = near;
-  session.data.awaiting = ['time'];
-  if (near.length === 0) return `Las ${formatTime(reqTime)} no está libre y no me quedan cercanas ese día 😕 ¿Otro día u hora?`;
-  return `Las ${formatTime(reqTime)} está ocupada 😕 pero tengo ${joinNatural(near.map(formatTime), 'o')}. ¿Cuál te sirve?`;
+  session.data.lastReply = out;
+  return out;
 }
 
 module.exports = {

@@ -146,13 +146,47 @@ function canSendProactive(business) {
 async function getBusinessInfo(businessId) {
   const { data: business } = await supabase
     .from('businesses').select('*').eq('id', businessId).single();
-  const { data: barbers } = await supabase
+  const { data: allBarbers } = await supabase
     .from('barbers').select('id,name,phone_e164')
     .eq('business_id', businessId).eq('is_active', true);
   const { data: services } = await supabase
     .from('services').select('id,name,duration_minutes,price')
     .eq('business_id', businessId).eq('is_active', true);
+
+  // Solo barberos RESERVABLES: activos Y con al menos un horario activo (FALLO 4)
+  const ids = (allBarbers || []).map(b => b.id);
+  let barbers = allBarbers || [];
+  if (ids.length) {
+    const { data: scheds } = await supabase
+      .from('schedules').select('barber_id').eq('is_active', true).in('barber_id', ids);
+    const withSched = new Set((scheds || []).map(s => s.barber_id));
+    const bookable = barbers.filter(b => withSched.has(b.id));
+    if (bookable.length) barbers = bookable; // si ninguno tiene horario, no rompas el flujo
+  }
   return { business, barbers, services };
+}
+
+// Próxima disponibilidad real de un barbero: hasta `maxDays` días con cupos,
+// `perDay` horas repartidas por día. Hoy solo cuenta horas futuras.
+async function getUpcoming(barberId, maxDays = 2, perDay = 2) {
+  const out = [];
+  const todayStr = todayPR();
+  const nowPR = new Date(Date.now() - 4 * 60 * 60 * 1000);
+  const nowMin = nowPR.getUTCHours() * 60 + nowPR.getUTCMinutes();
+  const base = new Date(todayStr + 'T12:00:00');
+  for (let offset = 0; offset <= 14 && out.length < maxDays; offset++) {
+    const d = new Date(base); d.setDate(base.getDate() + offset);
+    const dateStr = d.toISOString().split('T')[0];
+    let slots = await getAvailableSlots(barberId, dateStr);
+    if (offset === 0) slots = slots.filter(s => { const [h, m] = s.split(':').map(Number); return h * 60 + m > nowMin + 15; });
+    if (slots.length) {
+      const pick = [];
+      const step = Math.max(1, Math.floor(slots.length / perDay));
+      for (let i = 0; i < slots.length && pick.length < perDay; i += step) pick.push(slots[i]);
+      out.push({ date: dateStr, slots: pick });
+    }
+  }
+  return out;
 }
 
 async function getOwnerPhone(business) {
@@ -805,7 +839,7 @@ async function handleMessage(phone, message, businessId) {
       // Si el primer mensaje YA trae datos ("soy Carlos, corte mañana 3pm") → procesar
       if (looksBooking || bookingLogic.hasBookingContent(msg, services, barbers, [...GREETINGS], BOOKING_WORDS)) {
         const extracted = await extractBooking(msg, services, barbers, []);
-        return await bookingLogic.decideBookingReply({ session, msg, extracted, services, barbers, getSlots: getAvailableSlots });
+        return await bookingLogic.decideBookingReply({ session, msg, extracted, services, barbers, getSlots: getAvailableSlots, getUpcoming });
       }
       // Solo saludo / "cita" → abre pidiendo TODO en un mensaje
       session.data.awaiting = ['name', 'service', 'date', 'time'];
@@ -942,7 +976,7 @@ async function handleMessage(phone, message, businessId) {
   if (session.state === 'booking') {
     const extracted = await extractBooking(msg, services, barbers, session.data.awaiting || []);
     return await bookingLogic.decideBookingReply({
-      session, msg, extracted, services, barbers, getSlots: getAvailableSlots,
+      session, msg, extracted, services, barbers, getSlots: getAvailableSlots, getUpcoming,
     });
   }
 
