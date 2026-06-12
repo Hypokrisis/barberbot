@@ -732,6 +732,12 @@ async function handleMessage(phone, message, businessId) {
     return `Proceso cancelado. Escribe *"hola"* para comenzar de nuevo 👋`;
   }
 
+  // Un saludo a secas reinicia el flujo → siempre muestra el opener (no se queda pegado)
+  if (session.state !== 'idle' && GREETINGS.has(msgLower)) {
+    session.state = 'idle';
+    session.data = {};
+  }
+
   // ── IDLE ──────────────────────────────────────────────────────────────────
   if (session.state === 'idle') {
 
