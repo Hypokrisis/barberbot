@@ -989,33 +989,48 @@ async function handleMessage(phone, message, businessId) {
   return `Escribe *"hola"* para ver servicios, *"cita"* para agendar, o *"cambiar mi cita"* para reagendar.`;
 }
 
-// ── Rate limiter: 10 msgs / phone / 60s ──────────────────────────────────────
-const rateLimitMap = new Map(); // phone → { count, windowStart }
-const RATE_LIMIT = 10;
+// ── Rate limiter: 10 msgs / minuto (burst) + 30 msgs / hora (sostenido) ───────
+const rateLimitMap = new Map(); // phone → { minCount, minStart, hourCount, hourStart, warned }
+const RATE_LIMIT_MIN = 10;
 const RATE_WINDOW_MS = 60 * 1000;
+const RATE_LIMIT_HOUR = 30;
+const HOUR_WINDOW_MS = 60 * 60 * 1000;
 
-function isRateLimited(phone) {
+// Returns 'ok' (procesar), 'warn' (avisar una vez y cortar) o 'silent' (cortar sin avisar)
+function checkRateLimit(phone) {
   const now = Date.now();
-  const entry = rateLimitMap.get(phone);
-  if (!entry || now - entry.windowStart > RATE_WINDOW_MS) {
-    rateLimitMap.set(phone, { count: 1, windowStart: now });
-    return false;
+  let e = rateLimitMap.get(phone);
+  if (!e) { e = { minCount: 0, minStart: now, hourCount: 0, hourStart: now, warned: false }; rateLimitMap.set(phone, e); }
+  if (now - e.minStart > RATE_WINDOW_MS) { e.minCount = 0; e.minStart = now; }
+  if (now - e.hourStart > HOUR_WINDOW_MS) { e.hourCount = 0; e.hourStart = now; e.warned = false; }
+  e.minCount++; e.hourCount++;
+  const over = e.minCount > RATE_LIMIT_MIN || e.hourCount > RATE_LIMIT_HOUR;
+  if (!over) return 'ok';
+  if (!e.warned) {
+    e.warned = true;
+    console.warn(`[RATE_LIMIT] ${phone} — min=${e.minCount} hour=${e.hourCount}`);
+    return 'warn';
   }
-  entry.count++;
-  if (entry.count > RATE_LIMIT) {
-    console.warn(`[RATE_LIMIT] ${phone} — ${entry.count} msgs in window`);
-    return true;
-  }
-  return false;
+  return 'silent';
 }
 
-// Clean up stale rate limit entries every 5 minutes
+// Clean up stale entries every 5 minutes (once the hour window has fully elapsed)
 setInterval(() => {
-  const cutoff = Date.now() - RATE_WINDOW_MS;
-  for (const [phone, entry] of rateLimitMap.entries()) {
-    if (entry.windowStart < cutoff) rateLimitMap.delete(phone);
+  const now = Date.now();
+  for (const [phone, e] of rateLimitMap.entries()) {
+    if (now - e.hourStart > HOUR_WINDOW_MS) rateLimitMap.delete(phone);
   }
 }, 5 * 60 * 1000);
+
+// ── Contador de uso de mensajes por negocio (solo medición) ───────────────────
+async function bumpUsage(businessId, direction, n = 1) {
+  if (!businessId) return;
+  try {
+    await supabase.rpc('increment_message_usage', { p_business_id: businessId, p_direction: direction, p_count: n });
+  } catch (e) {
+    console.error('[USAGE] increment failed:', e.message);
+  }
+}
 
 // ── Twilio signature validator middleware ─────────────────────────────────────
 function validateTwilioSignature(req, res, next) {
@@ -1058,9 +1073,10 @@ app.post('/webhook', validateTwilioSignature, async (req, res) => {
   // Respond 200 immediately so Twilio doesn't retry
   res.status(200).end();
 
-  // Rate limit check
-  if (isRateLimited(phone)) {
-    await sendWhatsApp(phone, 'Un momento, estás enviando muchos mensajes. Intenta en un minuto. 🙏');
+  // Rate limit check (no llama a Groq ni a la DB si excede)
+  const rl = checkRateLimit(phone);
+  if (rl !== 'ok') {
+    if (rl === 'warn') await sendWhatsApp(phone, 'Has enviado demasiados mensajes. Intenta de nuevo más tarde. 🙏');
     return;
   }
 
@@ -1080,6 +1096,9 @@ app.post('/webhook', validateTwilioSignature, async (req, res) => {
     // Persist session after every message (write-through)
     if (sessions[phone]) await saveSession(phone, sessions[phone]);
     await sendWhatsApp(phone, reply);
+    // Medición de uso: 1 entrante procesado + 1 respuesta enviada
+    await bumpUsage(twilioSettings.business_id, 'inbound', 1);
+    await bumpUsage(twilioSettings.business_id, 'outbound', 1);
   } catch (err) {
     console.error('Webhook error:', err);
     await sendWhatsApp(phone, 'Ocurrió un error. Intenta de nuevo.');
