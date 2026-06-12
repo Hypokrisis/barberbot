@@ -1,6 +1,7 @@
-// Offline simulation of the redesigned booking flow.
-// Uses the REAL decision logic (booking-logic.js). The LLM extraction and the
-// availability lookup are mocked per turn so we can run dialogs deterministically.
+// Offline simulation of the redesigned booking flow (uses the REAL booking-logic.js).
+// The LLM extraction is mocked per turn. To prove the loop fix, the one-word
+// replies are given an EMPTY extraction ({}) — simulating Groq missing them — so
+// only the deterministic capture (awaiting + guessName/scan) can fill them.
 // Run: node test-booking-sim.js
 const bl = require('./booking-logic');
 
@@ -9,45 +10,46 @@ const services = [
   { id: 's2', name: 'Barba', price: 15, duration_minutes: 20 },
 ];
 const oneBarber = [{ id: 'b1', name: 'Annlo' }];
+const GREETINGS = ['hola','hi','hello','buenas','hey','ola'];
+const BOOKING_WORDS = ['cita','reservar','agendar','turno','reserva','book','nueva cita','hacer cita'];
 
 const created = [];
-function mockCreate(bk, phone) { created.push({ ...bk, phone }); return { appt: { id: 'apt_' + created.length }, error: null, isGuest: false }; }
 
-// Mimics index.js routing for the booking/confirm states + entry.
 function makeBot({ slots, barbers }) {
   const session = { state: 'idle', data: {} };
   let botMsgs = 0;
   const getSlots = async () => slots;
 
+  async function decide(text, extraction) {
+    return bl.decideBookingReply({ session, msg: text, extracted: extraction || {}, services, barbers, getSlots });
+  }
+
   async function send(userText, extraction) {
-    // entry: idle + booking intent
+    const m = userText.toLowerCase();
     if (session.state === 'idle') {
-      session.state = 'booking'; session.data.bk = {};
-      if (extraction && (extraction.name || extraction.service || extraction.date || extraction.time)) {
-        const r = await bl.decideBookingReply({ session, msg: userText, extracted: extraction, services, barbers, getSlots });
-        botMsgs++; return r;
+      const looks = bl.looksLikeBooking(userText, services);
+      if (GREETINGS.includes(m) || BOOKING_WORDS.some(w => m.includes(w)) || looks) {
+        session.state = 'booking'; session.data.bk = {};
+        if (looks || bl.hasBookingContent(userText, services, barbers, GREETINGS, BOOKING_WORDS)) {
+          botMsgs++; return await decide(userText, extraction);
+        }
+        session.data.awaiting = ['name','service','date','time'];
+        const svcLine = services.map(s => `${s.name} $${s.price}`).join(' / ');
+        botMsgs++; return `¡Saludos! 💈 Mándame en un solo mensaje: tu nombre, el servicio (${svcLine}) y el día y la hora. 📅`;
       }
-      const svcLine = services.map(s => `${s.name} $${s.price}`).join(' / ');
-      botMsgs++; return `¡Saludos! 💈 Para tu cita mándame en un solo mensaje: tu nombre, el servicio (${svcLine}) y el día y hora.`;
     }
-    if (session.state === 'booking') {
-      const r = await bl.decideBookingReply({ session, msg: userText, extracted: extraction || {}, services, barbers, getSlots });
-      botMsgs++; return r;
-    }
+    if (session.state === 'booking') { botMsgs++; return await decide(userText, extraction); }
     if (session.state === 'confirm') {
-      const norm = userText.toLowerCase().replace(/[áàä]/g,'a').replace(/[éèë]/g,'e').replace(/[íìï]/g,'i').replace(/[óòö]/g,'o').replace(/[úùü]/g,'u');
-      const yes = /^(si|dale|ok|confirmo|listo|va)\b/.test(norm);
-      if (yes) {
-        const bk = session.data.bk;
-        mockCreate(bk, '+17875550000');
+      const norm = m.replace(/[áàä]/g,'a').replace(/[éèë]/g,'e').replace(/[íìï]/g,'i').replace(/[óòö]/g,'o').replace(/[úùü]/g,'u');
+      if (/^(si|dale|ok|confirmo|listo|va)\b/.test(norm)) {
+        const bk = session.data.bk; created.push({ name: bk.name, service: bk.serviceName, date: bk.date, time: bk.time });
         session.state = 'idle'; session.data = {};
         botMsgs++; return `✅ ¡Listo, ${bk.name}! Te esperamos el ${bl.formatDate(bk.date)} a las ${bl.formatTime(bk.time)}. 💈`;
       }
-      session.state = 'booking';
-      botMsgs++; return `Claro, dime el dato correcto 🙂`;
+      session.state = 'booking'; botMsgs++; return `Claro, dime el dato correcto 🙂`;
     }
   }
-  return { send, count: () => botMsgs, session };
+  return { send, count: () => botMsgs };
 }
 
 async function runDialog(title, cfg, turns) {
@@ -57,49 +59,58 @@ async function runDialog(title, cfg, turns) {
   const bot = makeBot(cfg);
   for (const [userText, extraction] of turns) {
     console.log(`👤 ${userText}`);
-    const reply = await bot.send(userText, extraction);
-    console.log(`🤖 ${reply}`);
+    console.log(`🤖 ${await bot.send(userText, extraction)}`);
   }
-  console.log(`\n   → mensajes del bot: ${bot.count()}`);
-  return bot.count();
+  console.log(`   → mensajes del bot: ${bot.count()}`);
 }
 
 (async () => {
-  // 1) Todo en el primer mensaje, hora libre (10:00)
-  await runDialog('TEST 1 — cliente da todo de una (hora libre)',
-    { slots: ['09:00','09:30','10:00','14:00','16:00'], barbers: oneBarber },
+  // ── REPRO del transcript real: hola → cita → loann (NO debe loopear) ──
+  await runDialog('REPRO — hola → cita → loann (Groq NO captura "loann")',
+    { slots: ['09:00','10:00','15:00','15:30'], barbers: oneBarber },
     [
-      ['quiero cita, soy Carlos, corte mañana a las 10am', { name: 'Carlos', service: 'Corte', date: 'tomorrow', time: '10:00' }],
+      ['hola', {}],
+      ['cita', {}],
+      ['loann', {}],            // extracción vacía → guessName debe capturarlo
+      ['corte', {}],            // extracción vacía → matchService
+      ['mañana 3pm', {}],       // extracción vacía → scanDate + parseLooseTime
       ['sí', {}],
     ]);
 
-  // 2) Solo "quiero cita" → el bot pide todo junto
-  await runDialog('TEST 2 — solo "quiero cita"',
-    { slots: ['09:00','10:00','10:30','11:00'], barbers: oneBarber },
+  // 1) "hola" → saludo que pide TODO junto
+  await runDialog('TEST 1 — "hola" abre pidiendo todo junto',
+    { slots: ['09:00','10:00'], barbers: oneBarber },
+    [['hola', {}]]);
+
+  // 2) "soy loann, corte mañana 3pm" → directo a confirmar (Groq sí extrae)
+  await runDialog('TEST 2 — todo en el primer mensaje',
+    { slots: ['09:00','15:00','15:30'], barbers: oneBarber },
     [
-      ['quiero una cita', {}],
-      ['soy Ana, corte, mañana a las 10:30', { name: 'Ana', service: 'Corte', date: 'tomorrow', time: '10:30' }],
+      ['soy loann, corte mañana 3pm', { name: 'loann', service: 'Corte', date: 'tomorrow', time: '15:00' }],
       ['sí', {}],
     ]);
 
-  // 3) Pide 3pm ocupada → ofrece cercanas (no lista)
-  await runDialog('TEST 3 — 3pm ocupada → negocia cercanas',
-    { slots: ['09:00','09:30','14:00','14:30','16:00','16:30'], barbers: oneBarber },
+  // 3) "cita" → pide todo → "loann, corte, mañana 3pm" (Groq extrae) → confirmar
+  await runDialog('TEST 3 — "cita" → opener → datos completos',
+    { slots: ['09:00','15:00'], barbers: oneBarber },
     [
-      ['cita corte mañana 3pm, soy Luis', { name: 'Luis', service: 'Corte', date: 'tomorrow', time: '15:00' }],
-      ['2:30', { time: '14:30' }],
+      ['cita', {}],
+      ['loann, corte, mañana 3pm', { name: 'loann', service: 'Corte', date: 'tomorrow', time: '15:00' }],
       ['sí', {}],
     ]);
 
-  // 4) Confirma → verifica creación + cuenta total
+  // 4) Respuestas de UNA palabra a cada pregunta (Groq falla todas → determinista)
   const before = created.length;
-  const n = await runDialog('TEST 4 — confirmación crea la cita',
+  await runDialog('TEST 4 — una palabra por respuesta, Groq vacío',
     { slots: ['09:00','12:00','12:30'], barbers: oneBarber },
     [
-      ['soy Pedro, barba, mañana 12pm', { name: 'Pedro', service: 'Barba', date: 'tomorrow', time: '12:00' }],
+      ['hola', {}],
+      ['loann', {}],
+      ['barba', {}],
+      ['mañana', {}],
+      ['12pm', {}],
       ['confirmo', {}],
     ]);
-  console.log(`   → appointments creadas en este test: ${created.length - before}`);
-  console.log(`   → última cita guardada:`, created[created.length - 1] && { name: created[created.length-1].name, service: created[created.length-1].serviceName, date: created[created.length-1].date, time: created[created.length-1].time });
-  console.log(`   → total mensajes salientes del bot: ${n} (el template duplicado queda suprimido)`);
+  console.log(`   → cita creada: `, created[created.length - 1]);
+  console.log(`   → ¿se creó 1 cita en test 4?  ${created.length - before === 1 ? 'SÍ' : 'NO'}`);
 })();

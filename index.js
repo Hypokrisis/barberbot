@@ -657,17 +657,21 @@ function getOutOfHoursReply(business) {
 }
 
 // ── Slot-filling: LLM extractor (free-form → structured) ──────────────────────
-async function extractBooking(message, services, barbers) {
+async function extractBooking(message, services, barbers, awaiting = []) {
   const svcNames = services.map(s => s.name).join(', ');
   const barberNames = barbers.map(b => b.name).join(', ');
+  const askedMap = { name: 'el nombre', service: 'el servicio', barber: 'el barbero', date: 'el día', time: 'la hora' };
+  const askedLine = awaiting.length
+    ? `\nEl bot acaba de preguntar por: ${awaiting.map(a => askedMap[a] || a).join(', ')}. Si el mensaje es la respuesta, asígnalo a ese campo (una sola palabra normalmente es ${awaiting.includes('name') ? 'el nombre del cliente' : 'ese dato'}).`
+    : '';
   const sys = `Extrae datos de una solicitud de cita de barbería. Devuelve SOLO un objeto JSON:
 {"name":string|null,"service":string|null,"barber":string|null,"date":string|null,"time":string|null}
-- service: el más parecido de: ${svcNames}
-- barber: el más parecido de: ${barberNames || '(ninguno)'} (null si no lo menciona)
-- date: "today", "tomorrow", un día de la semana en español, o YYYY-MM-DD (null si no lo menciona)
-- time: HH:MM en 24h, ej "15:00" (null si no la menciona)
-- name: el nombre del cliente (null si no lo dice)
-No inventes nada que no esté en el mensaje.`;
+- name: el nombre del cliente si aparece (puede ser una sola palabra en minúscula). null si no.
+- service: SOLO si nombra un servicio de esta lista: ${svcNames}. No lo asumas. null si no lo menciona.
+- barber: el más parecido de: ${barberNames || '(ninguno)'}. null si no lo menciona.
+- date: "today", "tomorrow", un día de la semana en español, o YYYY-MM-DD. null si no lo menciona.
+- time: HH:MM en 24h, ej "15:00". null si no la menciona.${askedLine}
+No inventes datos que no estén en el mensaje.`;
   try {
     const c = await groq.chat.completions.create({
       model: 'llama-3.1-8b-instant',
@@ -756,12 +760,6 @@ async function handleMessage(phone, message, businessId) {
       // Sin cita activa → comportamiento de reset normal (cae abajo)
     }
 
-    // Saludo
-    if (GREETINGS.has(msgLower)) {
-      const svcList = services.map(s => `• ${s.name}: $${s.price}`).join('\n');
-      return `¡Hola! Soy el asistente de *${business.name}* 💈\n\n*Servicios:*\n${svcList}\n\nEscribe *"cita"* para agendar 📅 o *"cambiar mi cita"* para reagendar.`;
-    }
-
     // Reagendar — chequeado ANTES que booking para evitar confusión
     if (REAGENDAR_WORDS.some(w => msgLower.includes(w))) {
       const existing = await getActiveAppointment(phone, businessId);
@@ -793,18 +791,21 @@ async function handleMessage(phone, message, businessId) {
       return `⚠️ ¿Seguro que quieres cancelar?\n\n✂️ ${service?.name || 'Servicio'}\n💈 ${barber?.name || 'Barbero'}\n🗓 ${formatDate(existing.appointment_date)} a las ${formatTime(existing.start_time)}\n\n1. Sí, cancelar\n2. No, mantenerla`;
     }
 
-    // Iniciar booking (slot-filling: pide todo de una vez)
-    if (BOOKING_WORDS.some(w => msgLower.includes(w))) {
+    // Saludo, intención de cita, o un mensaje que ya trae datos de cita → slot-filling
+    const looksBooking = bookingLogic.looksLikeBooking(msg, services);
+    if (GREETINGS.has(msgLower) || BOOKING_WORDS.some(w => msgLower.includes(w)) || looksBooking) {
       session.state = 'booking';
       session.data.bk = {};
-      // El primer mensaje puede traer datos ("quiero cita, soy Carlos, corte mañana 3pm")
-      const extracted = await extractBooking(msg, services, barbers);
-      if (extracted && (extracted.name || extracted.service || extracted.date || extracted.time)) {
+      // Si el primer mensaje YA trae datos ("soy Carlos, corte mañana 3pm") → procesar
+      if (looksBooking || bookingLogic.hasBookingContent(msg, services, barbers, [...GREETINGS], BOOKING_WORDS)) {
+        const extracted = await extractBooking(msg, services, barbers, []);
         return await bookingLogic.decideBookingReply({ session, msg, extracted, services, barbers, getSlots: getAvailableSlots });
       }
+      // Solo saludo / "cita" → abre pidiendo TODO en un mensaje
+      session.data.awaiting = ['name', 'service', 'date', 'time'];
       const svcLine = services.map(s => `${s.name} $${s.price}`).join(' / ');
       const v = botVibe(business);
-      return `${v.open} Para tu cita mándame en *un solo mensaje*: tu nombre, el servicio (${svcLine}) y el día y hora que prefieres.`;
+      return `${v.open} Soy el asistente de *${business.name}*.\nMándame en *un solo mensaje*: tu nombre, el servicio (${svcLine}) y el día y la hora que prefieres. 📅`;
     }
 
     // Pro/Premium: Groq para preguntas generales
@@ -933,7 +934,7 @@ async function handleMessage(phone, message, businessId) {
 
   // ── BOOKING (slot-filling: extrae todo del mensaje libre) ─────────────────
   if (session.state === 'booking') {
-    const extracted = await extractBooking(msg, services, barbers);
+    const extracted = await extractBooking(msg, services, barbers, session.data.awaiting || []);
     return await bookingLogic.decideBookingReply({
       session, msg, extracted, services, barbers, getSlots: getAvailableSlots,
     });
