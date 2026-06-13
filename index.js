@@ -959,10 +959,11 @@ async function handleMessage(phone, message, businessId) {
     const name = session.data.customerName || 'cliente';
 
     let decision = null;
-    // MANTENER tiene prioridad (captura "no cancelar", "mejor no")
-    if (n === '2' || /\b(no|mantenla|mantenerla|dejala|dejarla|no canceles|no cancelar|mantener)\b/.test(n) || /mejor no|no la cancel|no cancel/.test(n)) decision = 'keep';
-    // CANCELAR
-    else if (n === '1' || /\b(si|cancela|cancelala|dale|confirmo|eso|hazlo|borrala|borra|elimina|eliminala)\b/.test(n) || /cancel/.test(n)) decision = 'cancel';
+    // MANTENER (palabras explícitas; "no" exacto, no cualquier frase con "no")
+    if (n === '2' || n === 'no' || /\b(mantenla|mantenerla|mantener|dejala|dejarla|no canceles|no cancelar|no la canceles)\b/.test(n) || /\bmejor no\b/.test(n)) decision = 'keep';
+    // CANCELAR (palabras explícitas)
+    else if (n === '1' || n === 'si' || /\b(cancela|cancelala|dale|confirmo|eso|hazlo|borrala|borra|elimina|eliminala)\b/.test(n) || /\bcancel/.test(n)) decision = 'cancel';
+    // Cualquier otra cosa (incl. "no sé") → decision queda null → re-preguntar
 
     if (decision === 'cancel') {
       const { error } = await supabase.from('appointments').update({ status: 'cancelled' }).eq('id', apptId);
