@@ -747,6 +747,12 @@ function botVibe(business) {
   }
 }
 
+// Único saludo/opener del bot — UNA sola fuente de verdad (FASE 2)
+function opener(business, services) {
+  const svcLine = services.map(s => `${s.name} $${s.price}`).join(' / ');
+  return `${botVibe(business).open} Soy el asistente de *${business.name}*.\nMándame en *un solo mensaje*: tu nombre, el servicio (${svcLine}) y el día y la hora que prefieres. 📅`;
+}
+
 async function handleMessage(phone, message, businessId) {
   const session = await getSession(phone);
   const { business, barbers, services } = await getBusinessInfo(businessId);
@@ -843,9 +849,7 @@ async function handleMessage(phone, message, businessId) {
       }
       // Solo saludo / "cita" → abre pidiendo TODO en un mensaje
       session.data.awaiting = ['name', 'service', 'date', 'time'];
-      const svcLine = services.map(s => `${s.name} $${s.price}`).join(' / ');
-      const v = botVibe(business);
-      return `${v.open} Soy el asistente de *${business.name}*.\nMándame en *un solo mensaje*: tu nombre, el servicio (${svcLine}) y el día y la hora que prefieres. 📅`;
+      return opener(business, services);
     }
 
     // Pro/Premium: Groq para preguntas generales
@@ -853,9 +857,11 @@ async function handleMessage(phone, message, businessId) {
       return askGroq(session, msg, business, services);
     }
 
-    // Basic/Trial: respuesta genérica
-    const svcList = services.map(s => `• ${s.name}: $${s.price}`).join('\n');
-    return `¡Hola! Soy el asistente de *${business.name}* 💈\n\n*Servicios:*\n${svcList}\n\nEscribe *"cita"* para agendar o visita:\n${bookingLink}`;
+    // Cualquier otro mensaje → abre el flujo con el ÚNICO saludo
+    session.state = 'booking';
+    session.data.bk = {};
+    session.data.awaiting = ['name', 'service', 'date', 'time'];
+    return opener(business, services);
   }
 
   // ── REAGENDAR CONFIRM ─────────────────────────────────────────────────────
@@ -946,30 +952,31 @@ async function handleMessage(phone, message, businessId) {
     return `✅ *¡Cita reagendada, ${customerName}!*\n\n✂️ ${service?.name || 'Servicio'}\n💈 ${barber?.name || 'Barbero'}\n📅 ${formatDate(newDate)} a las ${formatTime(startTime)}\n\n¡Te esperamos! 💈`;
   }
 
-  // ── CANCEL CONFIRM ────────────────────────────────────────────────────────
+  // ── CANCEL CONFIRM (acción destructiva: ambigüedad = re-preguntar, NUNCA asumir) ──
   if (session.state === 'cancel_confirm') {
-    if (msg === '1' || msgLower.includes('sí') || msgLower === 'si') {
-      const apptId = session.data.existingAppointmentId;
-      const { error } = await supabase
-        .from('appointments')
-        .update({ status: 'cancelled' })
-        .eq('id', apptId);
+    const n = msgLower.replace(/[áàä]/g, 'a').replace(/[éèë]/g, 'e').replace(/[íìï]/g, 'i').replace(/[óòö]/g, 'o').replace(/[úùü]/g, 'u').trim();
+    const apptId = session.data.existingAppointmentId;
+    const name = session.data.customerName || 'cliente';
 
-      session.state = 'idle';
-      const name = session.data.customerName;
-      session.data = {};
+    let decision = null;
+    // MANTENER tiene prioridad (captura "no cancelar", "mejor no")
+    if (n === '2' || /\b(no|mantenla|mantenerla|dejala|dejarla|no canceles|no cancelar|mantener)\b/.test(n) || /mejor no|no la cancel|no cancel/.test(n)) decision = 'keep';
+    // CANCELAR
+    else if (n === '1' || /\b(si|cancela|cancelala|dale|confirmo|eso|hazlo|borrala|borra|elimina|eliminala)\b/.test(n) || /cancel/.test(n)) decision = 'cancel';
 
-      if (error) {
-        return `Error al cancelar. Contáctanos directamente.`;
-      }
-      // El bot ya confirma aquí → borra el template duplicado del trigger
-      await suppressBotTemplate(apptId, 'cancelled');
-      return `Cita cancelada, ${name}. Si cambias de opinión escribe *"cita"* para agendar de nuevo. ¡Hasta pronto! 👋`;
-    } else {
-      session.state = 'idle';
-      session.data = {};
-      return `¡Perfecto! Tu cita se mantiene. ¡Te esperamos! 💈`;
+    if (decision === 'cancel') {
+      const { error } = await supabase.from('appointments').update({ status: 'cancelled' }).eq('id', apptId);
+      session.state = 'idle'; session.data = {};
+      if (error) return `Hubo un error al cancelar. Contáctanos directamente.`;
+      await suppressBotTemplate(apptId, 'cancelled'); // el bot ya confirma aquí
+      return `Listo, ${name}, tu cita quedó *cancelada*. Escribe *"cita"* cuando quieras agendar otra. 👋`;
     }
+    if (decision === 'keep') {
+      session.state = 'idle'; session.data = {};
+      return `¡Perfecto, ${name}! Tu cita se *mantiene*. ¡Te esperamos! 💈`;
+    }
+    // Ambiguo → re-preguntar (sigue en cancel_confirm, no se pierde el estado)
+    return `Para estar seguro 🙂 responde *1* para CANCELAR la cita, o *2* para MANTENERLA.`;
   }
 
   // ── BOOKING (slot-filling: extrae todo del mensaje libre) ─────────────────
@@ -993,7 +1000,7 @@ async function handleMessage(phone, message, businessId) {
       const endMin = bh * 60 + bm + (bk.serviceDuration || 30);
       const endTime = `${String(Math.floor(endMin/60)).padStart(2,'0')}:${String(endMin%60).padStart(2,'0')}`;
 
-      const { appt, error, isGuest } = await createAppointment({
+      const { appt, error } = await createAppointment({
         businessId,
         barberId: bk.barberId,
         serviceId: bk.serviceId,
@@ -1016,15 +1023,6 @@ async function handleMessage(phone, message, businessId) {
 
       const v = botVibe(business);
       const reply = `✅ ${v.ok}, ${bk.name}! Te esperamos el ${formatDate(bk.date)} a las ${formatTime(bk.time)}. 💈`;
-
-      // Invitado: 1 mensaje corto opcional de conversión a cuenta (fuera del flujo)
-      if (isGuest) {
-        const registerLink = `https://spaceyreserve.netlify.app/register?phone=${encodeURIComponent(phone)}`;
-        setTimeout(async () => {
-          try { await sendWhatsApp(phone, `💡 Crea tu cuenta gratis para ver y reagendar tus citas: ${registerLink}`); }
-          catch (err) { console.error('[Conversion]', err.message); }
-        }, 4000);
-      }
 
       session.state = 'idle';
       session.data = {};
