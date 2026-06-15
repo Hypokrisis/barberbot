@@ -98,6 +98,19 @@ async function run(title, turns) {
     ['sí', {}],
   ]);
 
+  // ── COMMIT 3: Límite de 30 días ───────────────────────────────────────────
+  await run('COMMIT 3 — fecha > 30 días → rechaza y ofrece ventana válida', [
+    // Simula que el LLM devuelve una fecha de hace mucho tiempo en el futuro (> 30 días)
+    // resolveDateToken no maneja "20 de agosto" así que usamos una fecha ISO directa
+    ['soy Ana, corte moderno con pepe', { service: 'Corte moderno', name: 'Ana' }],
+    // Ahora el "LLM" extrae una fecha que está a 60 días
+    ['el', { date: (() => { const d = new Date(bl.todayPR() + 'T12:00:00'); d.setDate(d.getDate() + 60); return d.toISOString().split('T')[0]; })() }],
+    // Cliente responde con una fecha válida
+    ['mañana', {}],
+    ['a las 9', {}],
+    ['sí', {}],
+  ]);
+
   // ── COMMIT 1: Reconocimiento de cliente (simulado con helpers de booking-logic) ──
   console.log('\n══════════════════════════════════════════');
   console.log('COMMIT 1 — RECONOCIMIENTO: lo_de_siempre pre-fill');

@@ -307,6 +307,19 @@ async function decideBookingReply({ session, msg, extracted, services, barbers, 
   if (extracted.time) { const t = normalizeTime(extracted.time); if (t) bk.time = t; }
   if (!bk.date) { const d = scanDate(msg); if (d) bk.date = d; }
   if (!bk.time) { const t = parseLooseTime(msg); if (t) bk.time = t; }
+
+  // Límite de 30 días: rechaza fechas demasiado lejanas
+  if (bk.date) {
+    const todayStr = todayPR();
+    const diffDays = Math.round((new Date(bk.date + 'T12:00:00') - new Date(todayStr + 'T12:00:00')) / 86400000);
+    if (diffDays > 30) {
+      const limit = new Date(todayStr + 'T12:00:00');
+      limit.setDate(limit.getDate() + 30);
+      bk.date = null;
+      session.data.awaiting = ['date', 'time'];
+      return `Solo puedo mostrarte disponibilidad hasta el *${formatDate(limit.toISOString().split('T')[0])}* 😊 ¿Qué fecha prefieres dentro de ese período?`;
+    }
+  }
   if (!bk.serviceId && awaiting.includes('service')) { const s = matchService(msg, services); if (s) setService(bk, s); }
 
   // ── NOMBRE y BARBERO por contexto — nunca confundir uno con el otro ──
