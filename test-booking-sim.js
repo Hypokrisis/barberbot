@@ -97,4 +97,28 @@ async function run(title, turns) {
     ['a las 9', {}],
     ['sí', {}],
   ]);
+
+  // ── COMMIT 1: Reconocimiento de cliente (simulado con helpers de booking-logic) ──
+  console.log('\n══════════════════════════════════════════');
+  console.log('COMMIT 1 — RECONOCIMIENTO: lo_de_siempre pre-fill');
+  console.log('══════════════════════════════════════════');
+  // Simula el estado que crea el handler lo_de_siempre tras decir "sí"
+  {
+    const session = { state: 'booking', data: {
+      bk: { name: 'Carlos', serviceId: 's1', serviceName: 'Corte moderno', serviceDuration: 30, servicePrice: 25, barberId: 'b3', barberName: 'Pacheco' },
+      awaiting: ['date', 'time'],
+      bk_offeredSlots: null,
+    }};
+    // Simula que el usuario elige el slot ofrecido
+    const up = await getUpcoming('b3');
+    const offered = [];
+    for (const g of up) for (const t of g.slots) offered.push({ date: g.date, time: t });
+    session.data.bk.offeredSlots = offered;
+    console.log('👤 [bot ya mostró slots de Pacheco — cliente responde:]');
+    console.log('👤 mañana a las 9');
+    const r = await bl.decideBookingReply({ session, msg: 'mañana a las 9', extracted: { date: 'tomorrow', time: '09:00' }, services, barbers, getSlots, getUpcoming });
+    console.log(`🤖 ${r}`);
+    const v = session.state === 'confirm' ? '✓ estado=confirm' : '⚠️ estado=' + session.state;
+    console.log(`   ${v} — bk.date=${session.data.bk?.date} bk.time=${session.data.bk?.time}`);
+  }
 })();

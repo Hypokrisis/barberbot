@@ -298,6 +298,33 @@ async function getActiveAppointment(phone, businessId) {
   return data;
 }
 
+async function getClientHistory(phone, businessId) {
+  const todayStr = todayPR();
+  const { data } = await supabase
+    .from('appointments')
+    .select('id, customer_name, appointment_date, start_time, barber_id, service_id, status, barbers(name), services(name)')
+    .eq('business_id', businessId)
+    .eq('customer_phone', phone)
+    .order('appointment_date', { ascending: false })
+    .limit(20);
+
+  if (!data || !data.length) return { hasHistory: false };
+
+  const name = data.find(a => a.customer_name)?.customer_name || null;
+  const active = data
+    .filter(a => a.status === 'confirmed' && a.appointment_date >= todayStr)
+    .sort((a, b) => (a.appointment_date < b.appointment_date ? -1 : 1))[0] || null;
+  const lastPast = data.find(a => a.appointment_date < todayStr && a.status !== 'cancelled') || null;
+
+  return {
+    hasHistory: true,
+    name,
+    activeAppointment: active,
+    lastService: lastPast ? { id: lastPast.service_id, name: lastPast.services?.name } : null,
+    lastBarber: lastPast ? { id: lastPast.barber_id, name: lastPast.barbers?.name } : null,
+  };
+}
+
 async function sendWhatsApp(to, body) {
   await twilioClient.messages.create({
     from: process.env.TWILIO_WHATSAPP_FROM,
@@ -837,17 +864,41 @@ async function handleMessage(phone, message, businessId) {
       return `⚠️ ¿Seguro que quieres cancelar?\n\n✂️ ${service?.name || 'Servicio'}\n💈 ${barber?.name || 'Barbero'}\n🗓 ${formatDate(existing.appointment_date)} a las ${formatTime(existing.start_time)}\n\n1. Sí, cancelar\n2. No, mantenerla`;
     }
 
-    // Saludo, intención de cita, o un mensaje que ya trae datos de cita → slot-filling
+    // Saludo, intención de cita, o mensaje con datos de booking
     const looksBooking = bookingLogic.looksLikeBooking(msg, services);
     if (GREETINGS.has(msgLower) || BOOKING_WORDS.some(w => msgLower.includes(w)) || looksBooking) {
-      session.state = 'booking';
       session.data.bk = {};
-      // Si el primer mensaje YA trae datos ("soy Carlos, corte mañana 3pm") → procesar
+      // Si el mensaje YA trae datos → procesar directamente sin reconocimiento
       if (looksBooking || bookingLogic.hasBookingContent(msg, services, barbers, [...GREETINGS], BOOKING_WORDS)) {
+        session.state = 'booking';
         const extracted = await extractBooking(msg, services, barbers, []);
         return await bookingLogic.decideBookingReply({ session, msg, extracted, services, barbers, getSlots: getAvailableSlots, getUpcoming });
       }
-      // Solo saludo / "cita" → abre pidiendo TODO en un mensaje
+      // Solo saludo / keyword → verificar historial antes de mostrar el opener
+      const history = await getClientHistory(phone, businessId);
+      if (history.hasHistory && history.name) {
+        if (history.activeAppointment) {
+          const appt = history.activeAppointment;
+          const barber = barbers.find(b => b.id === appt.barber_id);
+          const service = services.find(s => s.id === appt.service_id);
+          session.state = 'returning_menu';
+          session.data.customerName = history.name;
+          return `¡Hola de nuevo, ${history.name}! 👋\n\nTienes una cita el *${formatDate(appt.appointment_date)}* a las *${formatTime(appt.start_time)}* con ${barber?.name || 'tu barbero'}.\n\n¿Qué necesitas?\n1. Reagendar\n2. Agendar otra cita\n3. Preguntar algo`;
+        }
+        if (history.lastService && history.lastBarber) {
+          session.state = 'lo_de_siempre';
+          session.data.lastService = history.lastService;
+          session.data.lastBarber = history.lastBarber;
+          session.data.customerName = history.name;
+          return `¡Hola de nuevo, ${history.name}! 👋\n\n¿Lo de siempre — *${history.lastService.name}* con *${history.lastBarber.name}*? 😊\n\n1. Sí, ese\n2. No, quiero otra cosa`;
+        }
+        session.state = 'booking';
+        session.data.bk = { name: history.name };
+        session.data.awaiting = ['service', 'date', 'time'];
+        return `¡Hola de nuevo, ${history.name}! 👋 ¿En qué te ayudo?\n${services.map(s => `• ${s.name} $${s.price}`).join('\n')}`;
+      }
+      // Cliente nuevo
+      session.state = 'booking';
       session.data.awaiting = ['name', 'service', 'date', 'time'];
       return opener(business, services);
     }
@@ -857,7 +908,7 @@ async function handleMessage(phone, message, businessId) {
       return askGroq(session, msg, business, services);
     }
 
-    // Cualquier otro mensaje → abre el flujo con el ÚNICO saludo
+    // Cualquier otro mensaje → abre el flujo con el opener
     session.state = 'booking';
     session.data.bk = {};
     session.data.awaiting = ['name', 'service', 'date', 'time'];
@@ -978,6 +1029,83 @@ async function handleMessage(phone, message, businessId) {
     }
     // Ambiguo → re-preguntar (sigue en cancel_confirm, no se pierde el estado)
     return `Para estar seguro 🙂 responde *1* para CANCELAR la cita, o *2* para MANTENERLA.`;
+  }
+
+  // ── RETURNING MENU (cliente con cita activa, elige qué hacer) ────────────
+  if (session.state === 'returning_menu') {
+    const n = msg.trim();
+    if (n === '1') {
+      const existing = await getActiveAppointment(phone, businessId);
+      if (!existing) { session.state = 'idle'; session.data = {}; return opener(business, services); }
+      const barber = barbers.find(b => b.id === existing.barber_id);
+      const service = services.find(s => s.id === existing.service_id);
+      session.state = 'reagendar_confirm';
+      session.data.existingAppointmentId = existing.id;
+      session.data.existingBarberId = existing.barber_id;
+      session.data.existingServiceId = existing.service_id;
+      session.data.customerName = session.data.customerName || existing.customer_name;
+      return `📅 Tu cita actual:\n\n✂️ ${service?.name || 'Servicio'}\n💈 ${barber?.name || 'Barbero'}\n🗓 ${formatDate(existing.appointment_date)} a las ${formatTime(existing.start_time)}\n\n¿Quieres cambiarla?\n1. Sí, reagendar\n2. No, mantenerla`;
+    }
+    if (n === '2') {
+      const name = session.data.customerName;
+      session.state = 'booking';
+      session.data.bk = name ? { name } : {};
+      session.data.awaiting = name ? ['service', 'date', 'time'] : ['name', 'service', 'date', 'time'];
+      return opener(business, services);
+    }
+    if (n === '3') {
+      session.state = 'idle';
+      session.data = {};
+      if (canUseGroq(business)) return askGroq(session, msg, business, services);
+      return `¡Claro! Escribe tu pregunta y te ayudo 😊`;
+    }
+    return `Responde *1* para reagendar, *2* para nueva cita, o *3* para preguntar algo.`;
+  }
+
+  // ── LO DE SIEMPRE (cliente recurrente sin cita activa) ─────────────────
+  if (session.state === 'lo_de_siempre') {
+    const n = msgLower.trim();
+    const yes = n === '1' || n === 'sí' || n === 'si' || n === 'dale' || n === 'eso' || n === 'ok' || n === 'claro';
+    const no  = n === '2' || n === 'no' || n.includes('otra cosa') || n.includes('otro');
+    if (yes) {
+      const lastSvc = session.data.lastService;
+      const lastBar = session.data.lastBarber;
+      const name    = session.data.customerName;
+      const svc = services.find(s => s.id === lastSvc?.id);
+      const bar = barbers.find(b => b.id === lastBar?.id);
+      if (!svc || !bar) {
+        session.state = 'booking';
+        session.data.bk = name ? { name } : {};
+        session.data.awaiting = ['service', 'date', 'time'];
+        return `Parece que algo cambió desde tu última visita 😊 Elige un servicio:\n${services.map(s => `• ${s.name} $${s.price}`).join('\n')}`;
+      }
+      session.state = 'booking';
+      session.data.bk = {
+        name,
+        serviceId: svc.id, serviceName: svc.name,
+        serviceDuration: svc.duration_minutes || 30, servicePrice: svc.price,
+        barberId: bar.id, barberName: bar.name,
+      };
+      session.data.awaiting = ['date', 'time'];
+      const upcoming = await getUpcoming(bar.id, 2, 3);
+      if (!upcoming.length) return `No hay espacios próximos para ${bar.name} 😕 Escribe *"cita"* para elegir otro barbero.`;
+      const offered = [];
+      const parts   = [];
+      for (const g of upcoming) {
+        for (const t of g.slots) offered.push({ date: g.date, time: t });
+        parts.push(`${formatDate(g.date)} a las ${g.slots.map(s => formatTime(s)).join(' o ')}`);
+      }
+      session.data.bk.offeredSlots = offered;
+      return `¡Perfecto! *${svc.name} con ${bar.name}* — ¿cuándo lo quieres?\n\n${parts.join('\n')}\n\n¿Cuál te queda bien? 🙂`;
+    }
+    if (no) {
+      const name = session.data.customerName;
+      session.state = 'booking';
+      session.data.bk = name ? { name } : {};
+      session.data.awaiting = name ? ['service', 'date', 'time'] : ['name', 'service', 'date', 'time'];
+      return opener(business, services);
+    }
+    return `Responde *1* para lo de siempre o *2* para elegir otra cosa 😊`;
   }
 
   // ── BOOKING (slot-filling: extrae todo del mensaje libre) ─────────────────
