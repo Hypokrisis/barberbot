@@ -774,10 +774,13 @@ function botVibe(business) {
   }
 }
 
-// Único saludo/opener del bot — UNA sola fuente de verdad (FASE 2)
-function opener(business, services) {
-  const svcLine = services.map(s => `${s.name} $${s.price}`).join(' / ');
-  return `${botVibe(business).open} Soy el asistente de *${business.name}*.\nMándame en *un solo mensaje*: tu nombre, el servicio (${svcLine}) y el día y la hora que prefieres. 📅`;
+// Único saludo/opener del bot — UNA sola fuente de verdad
+function opener(business, services, barbers, bookingLink) {
+  const vibe = botVibe(business);
+  const svcList = (services || []).map(s => `• ${s.name} — $${s.price}`).join('\n');
+  const barberLine = (barbers || []).map(b => b.name).join(' • ');
+  const link = bookingLink || business.whatsapp_booking_link || `https://spaceyreserve.netlify.app/book/${business.slug || ''}`;
+  return `${vibe.open} Soy el asistente de *${business.name}*.\nPara tu cita dime en un mensaje: tu nombre, el servicio y el barbero que prefieres.\n\n✂️ *Servicios:*\n${svcList}${barberLine ? `\n\n💈 *Equipo:*\n${barberLine}` : ''}\n\nO reserva directo: ${link}`;
 }
 
 async function handleMessage(phone, message, businessId) {
@@ -900,7 +903,7 @@ async function handleMessage(phone, message, businessId) {
       // Cliente nuevo
       session.state = 'booking';
       session.data.awaiting = ['name', 'service', 'date', 'time'];
-      return opener(business, services);
+      return opener(business, services, barbers, bookingLink);
     }
 
     // Pro/Premium: Groq para preguntas generales
@@ -912,7 +915,7 @@ async function handleMessage(phone, message, businessId) {
     session.state = 'booking';
     session.data.bk = {};
     session.data.awaiting = ['name', 'service', 'date', 'time'];
-    return opener(business, services);
+    return opener(business, services, barbers, bookingLink);
   }
 
   // ── REAGENDAR CONFIRM ─────────────────────────────────────────────────────
@@ -1036,7 +1039,7 @@ async function handleMessage(phone, message, businessId) {
     const n = msg.trim();
     if (n === '1') {
       const existing = await getActiveAppointment(phone, businessId);
-      if (!existing) { session.state = 'idle'; session.data = {}; return opener(business, services); }
+      if (!existing) { session.state = 'idle'; session.data = {}; return opener(business, services, barbers, bookingLink); }
       const barber = barbers.find(b => b.id === existing.barber_id);
       const service = services.find(s => s.id === existing.service_id);
       session.state = 'reagendar_confirm';
@@ -1051,7 +1054,7 @@ async function handleMessage(phone, message, businessId) {
       session.state = 'booking';
       session.data.bk = name ? { name } : {};
       session.data.awaiting = name ? ['service', 'date', 'time'] : ['name', 'service', 'date', 'time'];
-      return opener(business, services);
+      return opener(business, services, barbers, bookingLink);
     }
     if (n === '3') {
       session.state = 'idle';
@@ -1103,7 +1106,7 @@ async function handleMessage(phone, message, businessId) {
       session.state = 'booking';
       session.data.bk = name ? { name } : {};
       session.data.awaiting = name ? ['service', 'date', 'time'] : ['name', 'service', 'date', 'time'];
-      return opener(business, services);
+      return opener(business, services, barbers, bookingLink);
     }
     return `Responde *1* para lo de siempre o *2* para elegir otra cosa 😊`;
   }
