@@ -283,6 +283,19 @@ async function createAppointment(data) {
   return { appt, error, isGuest: !registeredUser };
 }
 
+async function getAllActiveAppointments(phone, businessId) {
+  const todayStr = todayPR();
+  const { data } = await supabase
+    .from('appointments')
+    .select('id, customer_name, appointment_date, start_time, barber_id, service_id')
+    .eq('business_id', businessId)
+    .eq('customer_phone', phone)
+    .eq('status', 'confirmed')
+    .gte('appointment_date', todayStr)
+    .order('appointment_date', { ascending: true });
+  return data || [];
+}
+
 async function getActiveAppointment(phone, businessId) {
   const todayStr = todayPR();
   const { data } = await supabase
@@ -333,6 +346,35 @@ async function sendWhatsApp(to, body) {
   });
 }
 
+// ── Groq — clasificador de intención (reemplaza regex de strings) ─────────────
+async function classifyIntent(message) {
+  const sys = `Clasifica este mensaje de WhatsApp de un cliente de barbería en Puerto Rico. Devuelve SOLO la categoría en mayúsculas, sin explicación.
+
+REAGENDAR — cambiar, mover, reprogramar cita existente (ej: "cambiar mi cita", "no puedo ir a esa hora", "hay algo más tarde", "me puedes cambiar para otro día")
+CANCELAR — cancelar o borrar cita existente (ej: "cancelar", "no puedo ir", "quiero cancelar", "borra mi cita", "olvídalo")
+VER_CITA — consultar cuándo es su cita (ej: "cuándo es mi cita", "a qué hora tengo", "qué día tengo", "cuándo es lo mío")
+NUEVA_CITA — quiere hacer una cita nueva
+CONFIRMAR — confirma algo (ej: "sí", "dale", "ok", "eso", "confirmado", "va", "perfecto")
+NEGAR — rechaza o niega (ej: "no", "mejor no", "olvídalo", "no gracias")
+PREGUNTA_GENERAL — pregunta sobre precios, horarios, servicios, ubicación
+UNKNOWN — no se puede determinar`;
+
+  try {
+    const c = await groq.chat.completions.create({
+      model: 'llama-3.1-8b-instant',
+      messages: [{ role: 'system', content: sys }, { role: 'user', content: message }],
+      temperature: 0,
+      max_tokens: 20,
+    });
+    const result = c.choices[0].message.content.trim().toUpperCase().replace(/[^A-Z_]/g, '');
+    const valid = ['REAGENDAR','CANCELAR','VER_CITA','NUEVA_CITA','CONFIRMAR','NEGAR','PREGUNTA_GENERAL','UNKNOWN'];
+    return valid.includes(result) ? result : 'UNKNOWN';
+  } catch (e) {
+    console.error('[classifyIntent] failed:', e.message);
+    return 'UNKNOWN';
+  }
+}
+
 // ── Groq — solo para preguntas generales, nunca para el flujo de reservas ─────
 async function askGroq(session, message, business, services) {
   // Groq solo responde preguntas informativas. Si detecta intención de reservar,
@@ -366,8 +408,10 @@ REGLAS ESTRICTAS:
   // Si Groq detectó intención de reserva, redirigir al flujo nativo
   if (reply.startsWith('→CITA') || reply.includes('→CITA')) {
     session.history.push({ role: 'assistant', content: '[redirigido a flujo de cita]' });
-    session.state = 'name';
-    return `¡Claro! 💈 Para agendar tu cita, ¿cuál es tu nombre?`;
+    session.state = 'booking';
+    session.data.bk = {};
+    session.data.awaiting = ['name', 'service', 'date', 'time'];
+    return `¡Claro! 💈 Para agendar dime en un mensaje: tu nombre, el servicio y el día y la hora.`;
   }
 
   session.history.push({ role: 'assistant', content: reply });
@@ -690,12 +734,6 @@ const GREETINGS = new Set([
 // Palabras específicas de booking — "quiero" eliminado por ser demasiado genérico
 const BOOKING_WORDS = ['cita','reservar','agendar','turno','reserva','book','nueva cita','hacer cita'];
 
-// Palabras de reagendar — se chequean ANTES que BOOKING_WORDS
-const REAGENDAR_WORDS = ['reagendar','cambiar cita','cambiar mi cita','mover cita','reprogramar','reschedule','cambio de cita'];
-
-// Palabras de cancelar cita real (no solo resetear sesión)
-const CANCELAR_CITA_WORDS = ['cancelar mi cita','quiero cancelar','borrar mi cita'];
-
 // Solo resetea el flujo del bot, no cancela citas en DB
 const RESET_FLOW_WORDS = ['cancelar','salir','exit','reset','empezar','inicio'];
 
@@ -811,111 +849,164 @@ async function handleMessage(phone, message, businessId) {
   // ── IDLE ──────────────────────────────────────────────────────────────────
   if (session.state === 'idle') {
 
-    // Respuesta a recordatorio: CONFIRMO
+    // CONFIRMO exacto: fast path para respuesta a recordatorio
     if (msgLower === 'confirmo' || msgLower === 'confirmar' || msgLower === 'si confirmo') {
       const existing = await getActiveAppointment(phone, businessId);
       if (existing) {
-        // Ya está confirmada en DB; este es un acuse de recibo del cliente
         const barber = barbers.find(b => b.id === existing.barber_id);
         return `✅ ¡Perfecto, ${existing.customer_name}! Tu cita está confirmada.\n\n💈 ${barber?.name || 'Tu barbero'} te espera el ${formatDate(existing.appointment_date)} a las ${formatTime(existing.start_time)}. ¡Nos vemos! 🙌`;
       }
       return `No encontré una cita activa para tu número. Escribe *"cita"* para agendar una nueva.`;
     }
 
-    // Respuesta a recordatorio: CANCELAR (la palabra completa "cancelar" sin cita en proceso)
-    if (msgLower === 'cancelar' || msgLower === 'cancelar cita') {
-      const existing = await getActiveAppointment(phone, businessId);
-      if (existing) {
-        const barber = barbers.find(b => b.id === existing.barber_id);
-        const service = services.find(s => s.id === existing.service_id);
-        session.state = 'cancel_confirm';
-        session.data.existingAppointmentId = existing.id;
-        session.data.customerName = existing.customer_name;
-        return `⚠️ ¿Seguro que quieres cancelar?\n\n✂️ ${service?.name || 'Servicio'}\n💈 ${barber?.name || 'Barbero'}\n🗓 ${formatDate(existing.appointment_date)} a las ${formatTime(existing.start_time)}\n\n1. Sí, cancelar\n2. No, mantenerla`;
-      }
-      // Sin cita activa → comportamiento de reset normal (cae abajo)
+    // Clasificar intención (reemplaza REAGENDAR_WORDS, CANCELAR_CITA_WORDS y comparaciones de strings)
+    const looksBooking = bookingLogic.looksLikeBooking(msg, services);
+    const hasContent   = bookingLogic.hasBookingContent(msg, services, barbers, [...GREETINGS], BOOKING_WORDS);
+    const isGreeting   = GREETINGS.has(msgLower);
+    const isBookingWord = BOOKING_WORDS.some(w => msgLower.includes(w));
+
+    let intent;
+    if (isGreeting || isBookingWord) {
+      intent = 'NUEVA_CITA'; // fast path sin llamar a Groq
+    } else {
+      intent = await classifyIntent(msg);
+      if (intent === 'UNKNOWN' && (looksBooking || hasContent)) intent = 'NUEVA_CITA';
     }
 
-    // Reagendar — chequeado ANTES que booking para evitar confusión
-    if (REAGENDAR_WORDS.some(w => msgLower.includes(w))) {
-      const existing = await getActiveAppointment(phone, businessId);
-      if (!existing) {
-        return `No encontré una cita activa para tu número. ¿Quieres *agendar* una nueva? Escribe *"cita"*.`;
+    // ── REAGENDAR ──────────────────────────────────────────────────────────
+    if (intent === 'REAGENDAR') {
+      const allActive = await getAllActiveAppointments(phone, businessId);
+      if (!allActive.length) return `No encontré citas activas para tu número 😊 ¿Quieres *agendar* una nueva? Escribe *"cita"*.`;
+      if (allActive.length > 1) {
+        session.state = 'reagendar_select';
+        session.data.allActiveAppts = allActive;
+        session.data.customerName = allActive[0].customer_name;
+        const list = allActive.map((a, i) => {
+          const bar = barbers.find(b => b.id === a.barber_id);
+          const svc = services.find(s => s.id === a.service_id);
+          return `${i+1}. ${svc?.name || 'Servicio'} con ${bar?.name || 'Barbero'} — ${formatDate(a.appointment_date)} ${formatTime(a.start_time)}`;
+        }).join('\n');
+        return `Tienes varias citas. ¿Cuál quieres cambiar?\n\n${list}`;
       }
-      // Buscar barber y service para mostrar el resumen
-      const barber = barbers.find(b => b.id === existing.barber_id);
+      const existing = allActive[0];
+      const barber  = barbers.find(b => b.id === existing.barber_id);
       const service = services.find(s => s.id === existing.service_id);
       session.state = 'reagendar_confirm';
       session.data.existingAppointmentId = existing.id;
-      session.data.existingBarberId = existing.barber_id;
-      session.data.existingServiceId = existing.service_id;
-      session.data.customerName = existing.customer_name;
+      session.data.existingBarberId      = existing.barber_id;
+      session.data.existingServiceId     = existing.service_id;
+      session.data.customerName          = existing.customer_name;
       return `📅 Tu cita actual:\n\n✂️ ${service?.name || 'Servicio'}\n💈 ${barber?.name || 'Barbero'}\n🗓 ${formatDate(existing.appointment_date)} a las ${formatTime(existing.start_time)}\n\n¿Quieres cambiarla?\n1. Sí, reagendar\n2. No, mantenerla`;
     }
 
-    // Cancelar cita real
-    if (CANCELAR_CITA_WORDS.some(w => msgLower.includes(w))) {
+    // ── CANCELAR ───────────────────────────────────────────────────────────
+    if (intent === 'CANCELAR') {
       const existing = await getActiveAppointment(phone, businessId);
-      if (!existing) {
-        return `No encontré una cita activa para tu número.`;
-      }
-      const barber = barbers.find(b => b.id === existing.barber_id);
+      if (!existing) return `No encontré una cita activa para tu número. ¿Quieres *agendar* una?`;
+      const barber  = barbers.find(b => b.id === existing.barber_id);
       const service = services.find(s => s.id === existing.service_id);
       session.state = 'cancel_confirm';
       session.data.existingAppointmentId = existing.id;
-      session.data.customerName = existing.customer_name;
+      session.data.customerName          = existing.customer_name;
       return `⚠️ ¿Seguro que quieres cancelar?\n\n✂️ ${service?.name || 'Servicio'}\n💈 ${barber?.name || 'Barbero'}\n🗓 ${formatDate(existing.appointment_date)} a las ${formatTime(existing.start_time)}\n\n1. Sí, cancelar\n2. No, mantenerla`;
     }
 
-    // Saludo, intención de cita, o mensaje con datos de booking
-    const looksBooking = bookingLogic.looksLikeBooking(msg, services);
-    if (GREETINGS.has(msgLower) || BOOKING_WORDS.some(w => msgLower.includes(w)) || looksBooking) {
-      session.data.bk = {};
-      // Si el mensaje YA trae datos → procesar directamente sin reconocimiento
-      if (looksBooking || bookingLogic.hasBookingContent(msg, services, barbers, [...GREETINGS], BOOKING_WORDS)) {
-        session.state = 'booking';
-        const extracted = await extractBooking(msg, services, barbers, []);
-        return await bookingLogic.decideBookingReply({ session, msg, extracted, services, barbers, getSlots: getAvailableSlots, getUpcoming });
+    // ── VER CITA ───────────────────────────────────────────────────────────
+    if (intent === 'VER_CITA') {
+      const existing = await getActiveAppointment(phone, businessId);
+      if (!existing) return `No encontré citas activas para tu número 😊 Escribe *"cita"* para agendar.`;
+      const barber  = barbers.find(b => b.id === existing.barber_id);
+      const service = services.find(s => s.id === existing.service_id);
+      return `📅 Tu próxima cita:\n\n✂️ ${service?.name || 'Servicio'}\n💈 ${barber?.name || 'Barbero'}\n🗓 ${formatDate(existing.appointment_date)} a las ${formatTime(existing.start_time)}\n\n¿Necesitas reagendar? Escribe *"cambiar mi cita"*.`;
+    }
+
+    // ── CONFIRMAR (NLU: variantes de "sí" en IDLE) ─────────────────────────
+    if (intent === 'CONFIRMAR') {
+      const existing = await getActiveAppointment(phone, businessId);
+      if (existing) {
+        const barber = barbers.find(b => b.id === existing.barber_id);
+        return `✅ ¡Perfecto, ${existing.customer_name}! Tu cita está confirmada.\n\n💈 ${barber?.name || 'Tu barbero'} te espera el ${formatDate(existing.appointment_date)} a las ${formatTime(existing.start_time)}. ¡Nos vemos! 🙌`;
       }
-      // Solo saludo / keyword → verificar historial antes de mostrar el opener
-      const history = await getClientHistory(phone, businessId);
-      if (history.hasHistory && history.name) {
-        if (history.activeAppointment) {
-          const appt = history.activeAppointment;
-          const barber = barbers.find(b => b.id === appt.barber_id);
-          const service = services.find(s => s.id === appt.service_id);
-          session.state = 'returning_menu';
-          session.data.customerName = history.name;
-          return `¡Hola de nuevo, ${history.name}! 👋\n\nTienes una cita el *${formatDate(appt.appointment_date)}* a las *${formatTime(appt.start_time)}* con ${barber?.name || 'tu barbero'}.\n\n¿Qué necesitas?\n1. Reagendar\n2. Agendar otra cita\n3. Preguntar algo`;
-        }
-        if (history.lastService && history.lastBarber) {
-          session.state = 'lo_de_siempre';
-          session.data.lastService = history.lastService;
-          session.data.lastBarber = history.lastBarber;
-          session.data.customerName = history.name;
-          return `¡Hola de nuevo, ${history.name}! 👋\n\n¿Lo de siempre — *${history.lastService.name}* con *${history.lastBarber.name}*? 😊\n\n1. Sí, ese\n2. No, quiero otra cosa`;
-        }
-        session.state = 'booking';
-        session.data.bk = { name: history.name };
-        session.data.awaiting = ['service', 'date', 'time'];
-        return `¡Hola de nuevo, ${history.name}! 👋 ¿En qué te ayudo?\n${services.map(s => `• ${s.name} $${s.price}`).join('\n')}`;
+      intent = 'NUEVA_CITA';
+    }
+
+    // ── NEGAR (NLU: "mejor no", "no puedo ir", etc.) ──────────────────────
+    if (intent === 'NEGAR') {
+      const existing = await getActiveAppointment(phone, businessId);
+      if (existing) {
+        const barber  = barbers.find(b => b.id === existing.barber_id);
+        const service = services.find(s => s.id === existing.service_id);
+        session.state = 'cancel_confirm';
+        session.data.existingAppointmentId = existing.id;
+        session.data.customerName          = existing.customer_name;
+        return `⚠️ ¿Quieres cancelar tu cita?\n\n✂️ ${service?.name || 'Servicio'}\n💈 ${barber?.name || 'Barbero'}\n🗓 ${formatDate(existing.appointment_date)} a las ${formatTime(existing.start_time)}\n\n1. Sí, cancelar\n2. No, mantenerla`;
       }
-      // Cliente nuevo
+      intent = 'NUEVA_CITA';
+    }
+
+    // ── PREGUNTA GENERAL ───────────────────────────────────────────────────
+    if (intent === 'PREGUNTA_GENERAL') {
+      if (canUseGroq(business)) return askGroq(session, msg, business, services);
+      return `Servicios disponibles:\n${services.map(s => `• ${s.name} — $${s.price}`).join('\n')}\n\nEscribe *"cita"* para agendar.`;
+    }
+
+    // ── NUEVA CITA / UNKNOWN ───────────────────────────────────────────────
+    if (looksBooking || hasContent) {
       session.state = 'booking';
-      session.data.awaiting = ['name', 'service', 'date', 'time'];
-      return opener(business, services, barbers, bookingLink);
+      session.data.bk = {};
+      const extracted = await extractBooking(msg, services, barbers, []);
+      return await bookingLogic.decideBookingReply({ session, msg, extracted, services, barbers, getSlots: getAvailableSlots, getUpcoming });
     }
-
-    // Pro/Premium: Groq para preguntas generales
-    if (canUseGroq(business)) {
-      return askGroq(session, msg, business, services);
+    // Saludo sin datos → verificar historial del cliente
+    const history = await getClientHistory(phone, businessId);
+    if (history.hasHistory && history.name) {
+      if (history.activeAppointment) {
+        const appt    = history.activeAppointment;
+        const barber  = barbers.find(b => b.id === appt.barber_id);
+        const service = services.find(s => s.id === appt.service_id);
+        session.state = 'returning_menu';
+        session.data.customerName = history.name;
+        return `¡Hola de nuevo, ${history.name}! 👋\n\nTienes una cita el *${formatDate(appt.appointment_date)}* a las *${formatTime(appt.start_time)}* con ${barber?.name || 'tu barbero'}.\n\n¿Qué necesitas?\n1. Reagendar\n2. Agendar otra cita\n3. Preguntar algo`;
+      }
+      if (history.lastService && history.lastBarber) {
+        session.state = 'lo_de_siempre';
+        session.data.lastService  = history.lastService;
+        session.data.lastBarber   = history.lastBarber;
+        session.data.customerName = history.name;
+        return `¡Hola de nuevo, ${history.name}! 👋\n\n¿Lo de siempre — *${history.lastService.name}* con *${history.lastBarber.name}*? 😊\n\n1. Sí, ese\n2. No, quiero otra cosa`;
+      }
+      session.state = 'booking';
+      session.data.bk = { name: history.name };
+      session.data.awaiting = ['service', 'date', 'time'];
+      return `¡Hola de nuevo, ${history.name}! 👋 ¿En qué te ayudo?\n${services.map(s => `• ${s.name} $${s.price}`).join('\n')}`;
     }
-
-    // Cualquier otro mensaje → abre el flujo con el opener
+    // Cliente nuevo
     session.state = 'booking';
     session.data.bk = {};
     session.data.awaiting = ['name', 'service', 'date', 'time'];
     return opener(business, services, barbers, bookingLink);
+  }
+
+  // ── REAGENDAR SELECT (múltiples citas activas) ───────────────────────────
+  if (session.state === 'reagendar_select') {
+    const num = parseInt(msg) - 1;
+    const all = session.data.allActiveAppts || [];
+    if (isNaN(num) || num < 0 || num >= all.length) {
+      const list = all.map((a, i) => {
+        const bar = barbers.find(b => b.id === a.barber_id);
+        const svc = services.find(s => s.id === a.service_id);
+        return `${i+1}. ${svc?.name || 'Servicio'} con ${bar?.name || 'Barbero'} — ${formatDate(a.appointment_date)} ${formatTime(a.start_time)}`;
+      }).join('\n');
+      return `Elige un número:\n${list}`;
+    }
+    const chosen  = all[num];
+    const barber  = barbers.find(b => b.id === chosen.barber_id);
+    const service = services.find(s => s.id === chosen.service_id);
+    session.state = 'reagendar_confirm';
+    session.data.existingAppointmentId = chosen.id;
+    session.data.existingBarberId      = chosen.barber_id;
+    session.data.existingServiceId     = chosen.service_id;
+    return `📅 Cita elegida:\n\n✂️ ${service?.name || 'Servicio'}\n💈 ${barber?.name || 'Barbero'}\n🗓 ${formatDate(chosen.appointment_date)} a las ${formatTime(chosen.start_time)}\n\n¿Quieres cambiarla?\n1. Sí, reagendar\n2. No, mantenerla`;
   }
 
   // ── REAGENDAR CONFIRM ─────────────────────────────────────────────────────
