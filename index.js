@@ -633,6 +633,10 @@ async function sendReminders() {
     const tomorrowStr = tomorrowDate.toISOString().split('T')[0];
 
     // ── Recordatorio 24h (citas de mañana no notificadas) ──────────────────
+    // BUG 2 FIX: calcular minutos actuales en PR para filtrar por ventana 18-26h
+    const nowPR24 = new Date(new Date().getTime() - 4 * 60 * 60 * 1000);
+    const nowMins24 = nowPR24.getHours() * 60 + nowPR24.getMinutes();
+
     const { data: apt24 } = await supabase
       .from('appointments')
       .select(`
@@ -647,6 +651,10 @@ async function sendReminders() {
       .not('customer_phone', 'is', null);
 
     for (const apt of apt24 || []) {
+      // Solo enviar si la cita está entre 18 y 26 horas desde ahora
+      const [aptH, aptM] = apt.start_time.split(':').map(Number);
+      const minsUntilAppt = (24 * 60 - nowMins24) + (aptH * 60 + aptM);
+      if (minsUntilAppt < 18 * 60 || minsUntilAppt > 26 * 60) continue;
       const businessName = apt.businesses?.name || 'tu barbería';
       const barberName = apt.barbers?.name || 'el barbero';
       const serviceName = apt.services?.name || 'tu servicio';
@@ -678,8 +686,8 @@ async function sendReminders() {
     // ── Recordatorio 1h (citas de hoy dentro de ~1h no notificadas) ────────
     const nowPR = new Date(new Date().getTime() - 4 * 60 * 60 * 1000);
     const nowMins = nowPR.getHours() * 60 + nowPR.getMinutes();
-    const windowStart = nowMins + 50;  // entre 50 y 80 minutos desde ahora
-    const windowEnd = nowMins + 80;
+    const windowStart = nowMins + 45;  // ventana 45-75 minutos desde ahora
+    const windowEnd   = nowMins + 75;
 
     const { data: apt1h } = await supabase
       .from('appointments')
@@ -735,7 +743,8 @@ const GREETINGS = new Set([
 const BOOKING_WORDS = ['cita','reservar','agendar','turno','reserva','book','nueva cita','hacer cita'];
 
 // Solo resetea el flujo del bot, no cancela citas en DB
-const RESET_FLOW_WORDS = ['cancelar','salir','exit','reset','empezar','inicio'];
+// "cancelar" eliminado: lo maneja el NLU con prioridad absoluta
+const RESET_FLOW_WORDS = ['salir','exit','reset','empezar','inicio'];
 
 // ── Horario de atención del bot (opt-in vía whatsapp_bot_auto_schedule) ───────
 function parseHM(s) {
@@ -821,6 +830,53 @@ function opener(business, services, barbers, bookingLink) {
   return `${vibe.open} Soy el asistente de *${business.name}*.\nPara tu cita dime en un mensaje: tu nombre, el servicio y el barbero que prefieres.\n\n✂️ *Servicios:*\n${svcList}${barberLine ? `\n\n💈 *Equipo:*\n${barberLine}` : ''}\n\nO reserva directo: ${link}`;
 }
 
+// ── Helpers reutilizables: inician el flujo de reagendar / cancelar ──────────
+// Llamados tanto desde el intercept global como desde el bloque IDLE.
+async function startReagendar(phone, businessId, session, barbers, services) {
+  const allActive = await getAllActiveAppointments(phone, businessId);
+  if (!allActive.length) {
+    session.state = 'idle'; session.data = {};
+    return `No encontré citas activas para tu número 😊 ¿Quieres *agendar* una nueva? Escribe *"cita"*.`;
+  }
+  if (allActive.length > 1) {
+    session.state = 'reagendar_select';
+    session.data = { allActiveAppts: allActive, customerName: allActive[0].customer_name };
+    const list = allActive.map((a, i) => {
+      const bar = barbers.find(b => b.id === a.barber_id);
+      const svc = services.find(s => s.id === a.service_id);
+      return `${i+1}. ${svc?.name || 'Servicio'} con ${bar?.name || 'Barbero'} — ${formatDate(a.appointment_date)} ${formatTime(a.start_time)}`;
+    }).join('\n');
+    return `Tienes varias citas. ¿Cuál quieres cambiar?\n\n${list}`;
+  }
+  const e = allActive[0];
+  const barber  = barbers.find(b => b.id === e.barber_id);
+  const service = services.find(s => s.id === e.service_id);
+  session.state = 'reagendar_confirm';
+  session.data  = {
+    existingAppointmentId: e.id,
+    existingBarberId:      e.barber_id,
+    existingServiceId:     e.service_id,
+    customerName:          e.customer_name,
+  };
+  return `📅 Tu cita actual:\n\n✂️ ${service?.name || 'Servicio'}\n💈 ${barber?.name || 'Barbero'}\n🗓 ${formatDate(e.appointment_date)} a las ${formatTime(e.start_time)}\n\n¿Quieres cambiarla?\n1. Sí, reagendar\n2. No, mantenerla`;
+}
+
+async function startCancelar(phone, businessId, session, barbers, services) {
+  const existing = await getActiveAppointment(phone, businessId);
+  if (!existing) {
+    session.state = 'idle'; session.data = {};
+    return `No encontré una cita activa para tu número. ¿Quieres *agendar* una?`;
+  }
+  const barber  = barbers.find(b => b.id === existing.barber_id);
+  const service = services.find(s => s.id === existing.service_id);
+  session.state = 'cancel_confirm';
+  session.data  = {
+    existingAppointmentId: existing.id,
+    customerName:          existing.customer_name,
+  };
+  return `⚠️ ¿Seguro que quieres cancelar?\n\n✂️ ${service?.name || 'Servicio'}\n💈 ${barber?.name || 'Barbero'}\n🗓 ${formatDate(existing.appointment_date)} a las ${formatTime(existing.start_time)}\n\n1. Sí, cancelar\n2. No, mantenerla`;
+}
+
 async function handleMessage(phone, message, businessId) {
   const session = await getSession(phone);
   const { business, barbers, services } = await getBusinessInfo(businessId);
@@ -832,6 +888,9 @@ async function handleMessage(phone, message, businessId) {
   const offHours = getOutOfHoursReply(business);
   if (offHours) return offHours;
 
+  // BUG 3 FIX: word-level greeting detection (antes era exact-string)
+  const hasGreetingWord = msgLower.split(/\s+/).some(w => GREETINGS.has(w));
+
   // ── Reset de flujo (solo cuando está en medio de un proceso) ──────────────
   if (session.state !== 'idle' &&
       RESET_FLOW_WORDS.some(w => msgLower === w)) {
@@ -840,10 +899,20 @@ async function handleMessage(phone, message, businessId) {
     return `Proceso cancelado. Escribe *"hola"* para comenzar de nuevo 👋`;
   }
 
-  // Un saludo a secas reinicia el flujo → siempre muestra el opener (no se queda pegado)
-  if (session.state !== 'idle' && GREETINGS.has(msgLower)) {
+  // Un saludo reinicia el flujo → siempre muestra el opener (no se queda pegado)
+  if (session.state !== 'idle' && hasGreetingWord) {
     session.state = 'idle';
     session.data = {};
+  }
+
+  // ── BUG 1 FIX: Intercept global REAGENDAR/CANCELAR ────────────────────────
+  // Corre ANTES del state machine. Estos intents tienen prioridad absoluta sobre
+  // cualquier estado de sesión activo — interrumpen booking, returning_menu, etc.
+  const INTERRUPTABLE = new Set(['booking', 'confirm', 'returning_menu', 'lo_de_siempre', 'reagendar_select']);
+  if (INTERRUPTABLE.has(session.state) && !/^\d+$/.test(msg.trim())) {
+    const gi = await classifyIntent(msg);
+    if (gi === 'REAGENDAR') return await startReagendar(phone, businessId, session, barbers, services);
+    if (gi === 'CANCELAR')  return await startCancelar(phone, businessId, session, barbers, services);
   }
 
   // ── IDLE ──────────────────────────────────────────────────────────────────
@@ -859,10 +928,10 @@ async function handleMessage(phone, message, businessId) {
       return `No encontré una cita activa para tu número. Escribe *"cita"* para agendar una nueva.`;
     }
 
-    // Clasificar intención (reemplaza REAGENDAR_WORDS, CANCELAR_CITA_WORDS y comparaciones de strings)
-    const looksBooking = bookingLogic.looksLikeBooking(msg, services);
-    const hasContent   = bookingLogic.hasBookingContent(msg, services, barbers, [...GREETINGS], BOOKING_WORDS);
-    const isGreeting   = GREETINGS.has(msgLower);
+    // Clasificar intención (reemplaza comparaciones exactas de strings)
+    const looksBooking  = bookingLogic.looksLikeBooking(msg, services);
+    const hasContent    = bookingLogic.hasBookingContent(msg, services, barbers, [...GREETINGS], BOOKING_WORDS);
+    const isGreeting    = hasGreetingWord; // ya calculado arriba con word-level matching
     const isBookingWord = BOOKING_WORDS.some(w => msgLower.includes(w));
 
     let intent;
@@ -873,43 +942,9 @@ async function handleMessage(phone, message, businessId) {
       if (intent === 'UNKNOWN' && (looksBooking || hasContent)) intent = 'NUEVA_CITA';
     }
 
-    // ── REAGENDAR ──────────────────────────────────────────────────────────
-    if (intent === 'REAGENDAR') {
-      const allActive = await getAllActiveAppointments(phone, businessId);
-      if (!allActive.length) return `No encontré citas activas para tu número 😊 ¿Quieres *agendar* una nueva? Escribe *"cita"*.`;
-      if (allActive.length > 1) {
-        session.state = 'reagendar_select';
-        session.data.allActiveAppts = allActive;
-        session.data.customerName = allActive[0].customer_name;
-        const list = allActive.map((a, i) => {
-          const bar = barbers.find(b => b.id === a.barber_id);
-          const svc = services.find(s => s.id === a.service_id);
-          return `${i+1}. ${svc?.name || 'Servicio'} con ${bar?.name || 'Barbero'} — ${formatDate(a.appointment_date)} ${formatTime(a.start_time)}`;
-        }).join('\n');
-        return `Tienes varias citas. ¿Cuál quieres cambiar?\n\n${list}`;
-      }
-      const existing = allActive[0];
-      const barber  = barbers.find(b => b.id === existing.barber_id);
-      const service = services.find(s => s.id === existing.service_id);
-      session.state = 'reagendar_confirm';
-      session.data.existingAppointmentId = existing.id;
-      session.data.existingBarberId      = existing.barber_id;
-      session.data.existingServiceId     = existing.service_id;
-      session.data.customerName          = existing.customer_name;
-      return `📅 Tu cita actual:\n\n✂️ ${service?.name || 'Servicio'}\n💈 ${barber?.name || 'Barbero'}\n🗓 ${formatDate(existing.appointment_date)} a las ${formatTime(existing.start_time)}\n\n¿Quieres cambiarla?\n1. Sí, reagendar\n2. No, mantenerla`;
-    }
-
-    // ── CANCELAR ───────────────────────────────────────────────────────────
-    if (intent === 'CANCELAR') {
-      const existing = await getActiveAppointment(phone, businessId);
-      if (!existing) return `No encontré una cita activa para tu número. ¿Quieres *agendar* una?`;
-      const barber  = barbers.find(b => b.id === existing.barber_id);
-      const service = services.find(s => s.id === existing.service_id);
-      session.state = 'cancel_confirm';
-      session.data.existingAppointmentId = existing.id;
-      session.data.customerName          = existing.customer_name;
-      return `⚠️ ¿Seguro que quieres cancelar?\n\n✂️ ${service?.name || 'Servicio'}\n💈 ${barber?.name || 'Barbero'}\n🗓 ${formatDate(existing.appointment_date)} a las ${formatTime(existing.start_time)}\n\n1. Sí, cancelar\n2. No, mantenerla`;
-    }
+    // ── REAGENDAR / CANCELAR — delegado a helpers (evita duplicar el código del intercept global) ──
+    if (intent === 'REAGENDAR') return await startReagendar(phone, businessId, session, barbers, services);
+    if (intent === 'CANCELAR')  return await startCancelar(phone, businessId, session, barbers, services);
 
     // ── VER CITA ───────────────────────────────────────────────────────────
     if (intent === 'VER_CITA') {
