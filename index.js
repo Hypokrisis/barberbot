@@ -1119,8 +1119,8 @@ function validateTwilioSignature(req, res, next) {
 
 // ── Webhook ───────────────────────────────────────────────────────────────────
 app.post('/webhook', validateTwilioSignature, async (req, res) => {
-  const { Body, From } = req.body;
-  if (!Body || !From) return res.status(400).end();
+  const { Body, From, To } = req.body;
+  if (!Body || !From || !To) return res.status(400).end();
 
   const phone = From.replace('whatsapp:', '');
 
@@ -1137,11 +1137,15 @@ app.post('/webhook', validateTwilioSignature, async (req, res) => {
   console.log(`[${phone}] ${Body}`);
 
   try {
+    // Route by the receiving Twilio number so each business gets only its messages.
     const { data: twilioSettings, error } = await supabase
       .from('twilio_settings').select('business_id')
-      .eq('is_active', true).limit(1).maybeSingle();
+      .eq('whatsapp_from', To)
+      .eq('is_active', true)
+      .maybeSingle();
 
     if (error || !twilioSettings) {
+      console.warn(`[routing] No active twilio_settings for To=${To}`);
       await sendWhatsApp(phone, 'Servicio no disponible en este momento.');
       return;
     }
