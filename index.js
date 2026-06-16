@@ -196,31 +196,75 @@ async function getOwnerPhone(business) {
   return profile?.phone || null;
 }
 
-async function getAvailableSlots(barberId, date) {
+// Panorama real del día para un barbero: ventana abre–cierra, slots libres y
+// ocupados. Fuente única de verdad para disponibilidad (Punto 2 del rediseño).
+async function getDayAvailability(barberId, date) {
   const dow = new Date(date + 'T12:00:00').getDay();
   const { data: schedule } = await supabase
     .from('schedules').select('start_time,end_time')
     .eq('barber_id', barberId).eq('day_of_week', dow).eq('is_active', true)
     .maybeSingle();
-  if (!schedule) return [];
+  if (!schedule) return { closed: true, open: null, close: null, available: [], booked: [] };
 
   const { data: appointments } = await supabase
     .from('appointments').select('start_time,end_time')
     .eq('barber_id', barberId).eq('appointment_date', date).neq('status', 'cancelled');
 
-  const slots = [];
+  const open = schedule.start_time.slice(0, 5);
+  const close = schedule.end_time.slice(0, 5);
+  const bookedSet = new Set((appointments || []).map(a => a.start_time.slice(0, 5)));
+  const available = [], booked = [];
   let [sh, sm] = schedule.start_time.split(':').map(Number);
   const [eh, em] = schedule.end_time.split(':').map(Number);
   const endMins = eh * 60 + em;
   while (sh * 60 + sm + 30 <= endMins) {
     const slotStart = `${String(sh).padStart(2,'0')}:${String(sm).padStart(2,'0')}`;
-    if (!appointments?.some(a => a.start_time.slice(0,5) === slotStart)) {
-      slots.push(slotStart);
-    }
+    if (bookedSet.has(slotStart)) booked.push(slotStart);
+    else available.push(slotStart);
     sm += 30;
     if (sm >= 60) { sh++; sm -= 60; }
   }
-  return slots;
+  return { closed: false, open, close, available, booked };
+}
+
+// Compat: la mayoría del código solo necesita la lista de slots libres.
+async function getAvailableSlots(barberId, date) {
+  return (await getDayAvailability(barberId, date)).available;
+}
+
+const _toMinIdx = (t) => { const [h, m] = t.split(':').map(Number); return h * 60 + m; };
+
+// Clasifica una hora puntual contra el horario real + citas. Devuelve uno de:
+// available | booked | unaligned | outside_hours | closed | past
+// (Punto 2 y 4: distingue "ocupada" de "fuera de horario" y verifica vs DB).
+async function checkSlot(barberId, date, time) {
+  const day = await getDayAvailability(barberId, date);
+  const base = { open: day.open, close: day.close, available: day.available };
+  if (day.closed) return { status: 'closed', ...base };
+
+  if (date === todayPR()) {
+    const nowPR = new Date(Date.now() - 4 * 60 * 60 * 1000);
+    const nowMin = nowPR.getUTCHours() * 60 + nowPR.getUTCMinutes();
+    if (_toMinIdx(time) <= nowMin + 15) return { status: 'past', ...base };
+  }
+  const tMin = _toMinIdx(time);
+  if (tMin < _toMinIdx(day.open) || tMin + 30 > _toMinIdx(day.close)) {
+    return { status: 'outside_hours', ...base };
+  }
+  if (day.available.includes(time)) return { status: 'available', ...base };
+  if (day.booked.includes(time))    return { status: 'booked', ...base };
+  return { status: 'unaligned', ...base }; // dentro de horario pero no cae en slot de 30 min
+}
+
+// Resumen del horario semanal de un barbero (1 query, sin citas) para el prompt
+// de Groq: permite desambiguar AM/PM y detectar fuera de horario.
+async function getBarberHours(barberId) {
+  const { data } = await supabase
+    .from('schedules').select('day_of_week,start_time,end_time')
+    .eq('barber_id', barberId).eq('is_active', true);
+  const map = {};
+  (data || []).forEach(s => { map[s.day_of_week] = { open: s.start_time.slice(0, 5), close: s.end_time.slice(0, 5) }; });
+  return map;
 }
 
 // Normaliza teléfono a solo dígitos para comparar
@@ -315,39 +359,48 @@ async function sendWhatsApp(to, body) {
 // REGLA #2: el prompt SIEMPRE incluye el estado del bot y lo que se le acaba de
 // mostrar al cliente (las opciones), para que "hoy", "3:30", "el primero" se
 // entiendan en contexto.
-async function understand(message, services, barbers, state, offeredCtx) {
+async function understand(message, services, barbers, state, offeredCtx, hoursCtx) {
   const svc = services.map(s => s.name).join(', ');
   const bar = barbers.map(b => b.name).join(', ');
+  const inFlow = ['collecting', 'picking_slot', 'confirming', 'rescheduling'].includes(state);
   const hint = ({
     collecting:   'El bot está juntando nombre, servicio y barbero. Una palabra suelta suele ser el nombre del cliente o el barbero pedido.',
     picking_slot: 'El bot ofreció horarios. Un número, una hora o una posición ("el primero") es la elección (intent NUEVA_CITA).',
     rescheduling: 'El bot ofreció horarios para reagendar. Un número, una hora o una posición ("el primero") es la elección.',
-    confirming:   'El bot pidió confirmar (sí/no). "sí/dale/ok/eso/va/perfecto"=CONFIRMAR, "no/mejor no"=NEGAR.',
+    confirming:   'El bot pidió confirmar (sí/no). "sí/dale/ok/eso/va/perfecto"=CONFIRMAR, "no/mejor no/nah/qué va"=NEGAR.',
   })[state] || '';
 
   const offered = offeredCtx
-    ? `\nOpciones que se le acaban de mostrar al cliente (en orden, 1-based): ${offeredCtx}. Si dice "el primero"/"la segunda"/"ese"/"la última", devuelve "choice" con esa posición.`
+    ? `\nOpciones que se le acaban de mostrar al cliente (en orden, 1-based): ${offeredCtx}. Si dice "el primero"/"la segunda"/"ese"/"la última" SIN mencionar una hora, devuelve "choice" con esa posición.`
     : '';
+  const hours = hoursCtx ? `\nHorario del barbero: ${hoursCtx}. Úsalo para interpretar la hora.` : '';
 
   const sys = `Eres el cerebro de un bot de citas de barbería en Puerto Rico. Analiza el mensaje EN CONTEXTO y devuelve SOLO JSON:
-{"intent":"NUEVA_CITA|REAGENDAR|CANCELAR|VER_CITA|CONFIRMAR|NEGAR|PREGUNTA_GENERAL|UNKNOWN","name":string|null,"service":string|null,"barber":string|null,"date":string|null,"time":string|null,"choice":number|null}
+{"intent":"NUEVA_CITA|REAGENDAR|CANCELAR|VER_CITA|CONFIRMAR|NEGAR|PREGUNTA_GENERAL|FUERA_DE_CONTEXTO|UNKNOWN","name":string|null,"service":string|null,"barber":string|null,"date":string|null,"time":string|null,"choice":number|null,"ampm_ambiguous":boolean}
 
-intent:
+PASO 1 — ¿el mensaje es sobre la barbería? Relacionado = reservar/reagendar/cancelar, preguntar por servicios/precios/horarios/ubicación/barberos, o una respuesta dentro del flujo activo. NO relacionado = otros temas (clima, matemáticas, etc.), preguntas sobre "Spacey Reserve" como plataforma, spam, o números/saludos raros sin flujo activo → intent="FUERA_DE_CONTEXTO".
+${inFlow ? 'OJO: el cliente está EN MEDIO de un flujo activo. Un mensaje corto o ambiguo ("nah","ese","las 6","ok","el azul") casi siempre es una respuesta al flujo — interprétalo como tal ANTES de marcarlo FUERA_DE_CONTEXTO. Solo usa FUERA_DE_CONTEXTO si es CLARAMENTE ajeno (ej "ayúdame con mate").' : ''}
+
+intent (si es sobre la barbería):
 - REAGENDAR: cambiar/mover/reprogramar una cita (ej "cambiar mi cita","no puedo ir a esa hora","hay algo más tarde")
 - CANCELAR: cancelar/borrar una cita (ej "cancela","ya no puedo ir","olvídalo","borra mi cita")
 - VER_CITA: preguntar cuándo es su cita (ej "cuándo es mi cita","a qué hora tengo")
 - NUEVA_CITA: quiere agendar o da datos de una cita
 - CONFIRMAR: afirmación (sí, dale, ok, eso, va, perfecto, confirmo, claro)
-- NEGAR: negación (no, mejor no, nada, olvídalo)
+- NEGAR: negación (no, mejor no, nada, nah, qué va, olvídalo)
 - PREGUNTA_GENERAL: precios, horarios, ubicación, servicios
-- UNKNOWN: no está claro
+- UNKNOWN: sobre la barbería pero no está claro qué quiere
 name: nombre del cliente si aparece. null si no.
 service: SOLO de esta lista exacta: ${svc}. null si no lo menciona.
 barber: SOLO si pide con quién atenderse (de: ${bar || 'ninguno'}). null si no.
 date: "today","tomorrow", día de semana en español, o YYYY-MM-DD. null si no.
-time: "HH:MM" en 24h. null si no.
-choice: posición 1-based si elige por orden ("el primero"=1,"la segunda"=2). null si no.
-Estado actual del bot: ${state}.${hint ? ' ' + hint : ''}${offered}
+time: la hora EXACTA que pidió el cliente, en "HH:MM" 24h. null si no menciona hora.
+  · Si menciona una hora ("6pm","las 6","a las 10"), SIEMPRE ponla en "time" y NO uses "choice".
+  · NUNCA ajustes/redondees la hora a una opción de la lista: devuelve la hora LITERAL que pidió.
+  · Desambigua AM/PM con el horario del barbero (ej "las 6" con horario 10:00–19:00 → "18:00").
+choice: posición 1-based SOLO si elige por orden sin mencionar hora ("el primero"=1). null si menciona una hora.
+ampm_ambiguous: true SOLO si la hora cabe tanto en AM como en PM dentro del horario y no puedes decidir; si no, false.
+Estado actual del bot: ${state}.${hint ? ' ' + hint : ''}${hours}${offered}
 No inventes datos que no estén en el mensaje.`;
 
   try {
@@ -355,13 +408,14 @@ No inventes datos que no estén en el mensaje.`;
       model: 'llama-3.1-8b-instant',
       messages: [{ role: 'system', content: sys }, { role: 'user', content: message }],
       temperature: 0,
-      max_tokens: 180,
+      max_tokens: 200,
       response_format: { type: 'json_object' },
     });
     const j = JSON.parse(c.choices[0].message.content) || {};
-    const valid = ['NUEVA_CITA','REAGENDAR','CANCELAR','VER_CITA','CONFIRMAR','NEGAR','PREGUNTA_GENERAL','UNKNOWN'];
+    const valid = ['NUEVA_CITA','REAGENDAR','CANCELAR','VER_CITA','CONFIRMAR','NEGAR','PREGUNTA_GENERAL','FUERA_DE_CONTEXTO','UNKNOWN'];
     if (!valid.includes(j.intent)) j.intent = 'UNKNOWN';
     if (!Number.isInteger(j.choice)) j.choice = null;
+    j.ampm_ambiguous = j.ampm_ambiguous === true;
     return j;
   } catch (e) {
     console.error('[understand] failed:', e.message);
@@ -787,8 +841,27 @@ async function handleMessage(phone, message, businessId) {
       .join(', ');
   }
 
+  // Contexto de horario del barbero en juego (Punto 1): para desambiguar AM/PM
+  // y reconocer "fuera de horario". 1 query, solo en estados de flujo con barbero.
+  let hoursCtx = '';
+  const flowBarberId = session.data?.bk?.barberId;
+  if (flowBarberId && ['collecting', 'picking_slot', 'rescheduling'].includes(session.state)) {
+    const hoursMap = await getBarberHours(flowBarberId);
+    const baseD = new Date(todayPR() + 'T12:00:00');
+    const labels = ['hoy', 'mañana'];
+    const dowAbbr = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'];
+    const parts = [];
+    for (let off = 0; off <= 2; off++) {
+      const dd = new Date(baseD); dd.setDate(baseD.getDate() + off);
+      const h = hoursMap[dd.getDay()];
+      parts.push(`${labels[off] || dowAbbr[dd.getDay()]} ${h ? h.open + '–' + h.close : 'cerrado'}`);
+    }
+    const bn = session.data.bk.barberName || '';
+    hoursCtx = `${bn ? bn + ': ' : ''}${parts.join(', ')}`;
+  }
+
   // Groq interpreta TODO el mensaje en UNA sola llamada: intención + datos de cita
-  const understood = await understand(msg, services, barbers, session.state, offeredCtx);
+  const understood = await understand(msg, services, barbers, session.state, offeredCtx, hoursCtx);
 
   // El motor (booking-logic.js) decide la respuesta y muta la sesión.
   // Toda la I/O entra por `deps` para mantener el motor testeable.
@@ -799,6 +872,8 @@ async function handleMessage(phone, message, businessId) {
     ctx: { business, services, barbers, bookingLink, history, phone },
     deps: {
       getSlots: getAvailableSlots,
+      getDayAvailability,
+      checkSlot,
       getUpcoming,
       getActiveAppointments: () => getAllActiveAppointments(phone, businessId),
       commitCreate: async (bk) => {
@@ -954,7 +1029,7 @@ app.post('/webhook', validateTwilioSignature, async (req, res) => {
   }
 });
 
-app.get('/health', (_, res) => res.json({ status: 'ok', version: '4.0.0-final-flow' }));
+app.get('/health', (_, res) => res.json({ status: 'ok', version: '4.1.0-context-aware' }));
 
 app.post('/admin/report', async (req, res) => {
   const { type = 'bihourly' } = req.body;
@@ -986,7 +1061,7 @@ console.log('✅ Cron jobs registered');
 // ── Server ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
-  console.log('✅ BarberBot v4.0.0-final-flow started');
+  console.log('✅ BarberBot v4.1.0-context-aware started');
   console.log(`🚀 Server running on port ${PORT}`);
 });
 

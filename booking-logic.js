@@ -165,7 +165,9 @@ async function respond({ session, msg, understood, ctx, deps }) {
   const d = session.data || (session.data = {});
   const I = (understood && understood.intent) || 'UNKNOWN';
   const rawNum = /^\d+$/.test(msg.trim()) ? parseInt(msg.trim(), 10) : null;            // "1", "2"
-  const choiceNum = rawNum || (Number.isInteger(understood.choice) ? understood.choice : null); // + "el primero"
+  // Punto 3: si Groq devolvió una hora explícita, NUNCA la tratamos como "choice"
+  // por índice. La hora manda y se verifica contra la DB.
+  const choiceNum = rawNum || (understood.time ? null : (Number.isInteger(understood.choice) ? understood.choice : null));
 
   // ── utilidades locales ──────────────────────────────────────────────────────
   function reword(t) {
@@ -205,7 +207,7 @@ async function respond({ session, msg, understood, ctx, deps }) {
     if (understood.service) { const s = matchService(understood.service, services); if (s) setService(bk, s); }
     if (understood.barber)  { const b = matchBarber(understood.barber, barbers);   if (b) setBarber(bk, b); }
     const wd = resolveDateToken(understood.date); if (wd) bk.wantDate = wd;
-    const wt = normalizeTime(understood.time);    if (wt) bk.wantTime = wt;
+    const wt = normalizeTime(understood.time);    if (wt) { bk.wantTime = wt; bk.wantTimeAmbiguous = !!understood.ampm_ambiguous; }
     return bk;
   }
 
@@ -238,26 +240,28 @@ async function respond({ session, msg, understood, ctx, deps }) {
 
   // Construye y muestra disponibilidad. Mueve a picking_slot / rescheduling.
   // Máx 3 días hacia adelante × hasta 3 horarios por día. Solo cupos reales.
-  async function offerSlots(forReschedule) {
+  // `lead` opcional: frase introductoria (ej "Ese día no abre 😕").
+  async function offerSlots(forReschedule, lead) {
     const bk = d.bk;
     const nextState = forReschedule ? 'rescheduling' : 'picking_slot';
+    const head = lead ? `${lead}\n\n` : '';
     if (!bk || !bk.barberId) {
       return out(`Para ver horarios dime con qué barbero 🙂`, 'collecting');
     }
     const up = await deps.getUpcoming(bk.barberId, 3, 3); // hasta 3 días × 3 = 9
     if (!up || !up.length) {
-      return out(`${bk.barberName} no tiene espacios próximos 😕\n📅 Reserva en el calendario: ${linkOnce()}`, nextState);
+      return out(`${head}${bk.barberName} no tiene espacios próximos 😕\n📅 Reserva en el calendario: ${linkOnce()}`, nextState);
     }
     d.offered = [];
     const blocks = [];
     up.forEach((g, gi) => {
       for (const t of g.slots) d.offered.push({ date: g.date, time: t });
-      const head = gi === 0 ? `*${displayDay(g.date)}* (${shortDate(g.date)})` : `*${displayDay(g.date)}*`;
-      blocks.push(`${head}\n- ${g.slots.map(formatTime).join(' • ')}`);
+      const hd = gi === 0 ? `*${displayDay(g.date)}* (${shortDate(g.date)})` : `*${displayDay(g.date)}*`;
+      blocks.push(`${hd}\n- ${g.slots.map(formatTime).join(' • ')}`);
     });
     d.negotiation = 0;
     return out(
-      `📅 *${bk.barberName}* disponible:\n\n${blocks.join('\n\n')}\n\n` +
+      `${head}📅 *${bk.barberName}* disponible:\n\n${blocks.join('\n\n')}\n\n` +
       `¿Cuál te queda bien?\nSi no ves una que te sirva, dime la hora que prefieres y te verifico 😊\n` +
       `📅 O elige en el calendario: ${linkOnce()}`,
       nextState
@@ -277,59 +281,98 @@ async function respond({ session, msg, understood, ctx, deps }) {
     );
   }
 
+  // AM/PM genuinamente ambiguo → ofrecer las dos interpretaciones como opciones
+  // y dejar que el cliente elija. NUNCA asumir (decisión del usuario).
+  function ampmAsk(date, forReschedule) {
+    const t = normalizeTime(understood.time);
+    const [h, m] = t.split(':').map(Number);
+    const base = h % 12;
+    const amT = `${String(base).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+    const pmT = `${String(base + 12).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+    d.offered = [{ date, time: amT }, { date, time: pmT }];
+    d.negotiation = 0;
+    return out(`¿Te refieres a las ${formatTime(amT)} o las ${formatTime(pmT)}? 🙂`,
+      forReschedule ? 'rescheduling' : 'picking_slot');
+  }
+
+  // CHOKEPOINT (Punto 4): toda hora puntual se verifica contra la DB aquí antes
+  // de confirmar. checkSlot distingue ocupada / fuera de horario / cerrado / pasada.
+  async function confirmSlot(date, time, forReschedule) {
+    const bk = d.bk;
+    const nextState = forReschedule ? 'rescheduling' : 'picking_slot';
+    if (daysFromToday(date) > 30) {
+      return out(`Solo puedo agendar hasta el *${formatDate(limitDateStr())}* 😊 ¿Qué otra fecha te sirve?`, nextState);
+    }
+    const chk = await deps.checkSlot(bk.barberId, date, time);
+    if (chk.status === 'available') return await commitChosen({ date, time }, forReschedule);
+
+    // No disponible: NO se confirma nada (Punto 3). Se ofrece y el cliente re-elige.
+    d.negotiation = (d.negotiation || 0) + 1;
+    if (d.negotiation > 2) {
+      resetData();
+      return out(`No logramos cuadrar la hora 😕 Mejor elige directo en el calendario: ${linkOnce()}`, 'idle');
+    }
+    const within = chk.available || [];
+    const near = within.length ? nearestSlots(within, time, 2) : [];
+
+    // Sin cupos ese día (cerrado / pasada / vacío) → mostrar próximos días reales.
+    if (chk.status === 'closed' || chk.status === 'past' || within.length === 0) {
+      const lead = chk.status === 'closed' ? `Ese día ${bk.barberName} no abre 😕`
+                 : chk.status === 'past'   ? `Esa hora ya pasó ⌛`
+                 : `No me quedan espacios ese día 😕`;
+      return await offerSlots(forReschedule, lead);
+    }
+    // Hay cupos ese día → ofrecer los más cercanos, con el motivo correcto.
+    d.offered = near.map(x => ({ date, time: x }));
+    let lead;
+    if (chk.status === 'outside_hours') {
+      lead = `${bk.barberName} trabaja ese día de ${formatTime(chk.open)} a ${formatTime(chk.close)} 😊`;
+    } else if (chk.status === 'booked') {
+      lead = `Las ${formatTime(time)} está ocupada 😕`;
+    } else { // unaligned (dentro de horario pero no cae en slot de 30 min)
+      lead = `No tengo exactamente las ${formatTime(time)} 😕`;
+    }
+    return out(`${lead} Tengo ${joinNatural(near.map(formatTime), 'o')}, ¿cuál te sirve?`, nextState);
+  }
+
   // Interpreta la elección de horario (compartido entre picking_slot y rescheduling)
   async function pickSlot(forReschedule) {
     const bk = d.bk;
     const offered = d.offered || [];
 
-    // 1. Elección por posición ("1", "el primero", "la segunda")
+    // 0. AM/PM ambiguo → preguntar una vez (sin asumir).
+    if (understood.time && understood.ampm_ambiguous) {
+      const date = resolveDateToken(understood.date) || (offered[0] && offered[0].date) || todayPR();
+      return ampmAsk(date, forReschedule);
+    }
+    // 1. Elección por posición ("1", "el primero") — re-verifica vs DB (Punto 4).
     if (choiceNum && choiceNum >= 1 && choiceNum <= offered.length) {
-      return await commitChosen(offered[choiceNum - 1], forReschedule);
+      const sel = offered[choiceNum - 1];
+      return await confirmSlot(sel.date, sel.time, forReschedule);
     }
-    // 2. Hora que coincide con una de las ofrecidas
-    if (understood.time) {
-      const t = normalizeTime(understood.time);
-      const wantDate = resolveDateToken(understood.date);
-      const hit = offered.find(o => o.time === t && (!wantDate || o.date === wantDate));
-      if (hit) return await commitChosen(hit, forReschedule);
-    }
-    // 3. Hora libre pedida fuera de la lista → verificar
+    // 2. Hora explícita → SIEMPRE se verifica contra la DB (Punto 2 y 4).
     if (understood.time) {
       const t = normalizeTime(understood.time);
       const targetDate = resolveDateToken(understood.date) || (offered[0] && offered[0].date) || todayPR();
-      if (daysFromToday(targetDate) > 30) {
-        return out(`Solo puedo agendar hasta el *${formatDate(limitDateStr())}* 😊 ¿Qué otra fecha te sirve?`);
-      }
-      const slots = await deps.getSlots(bk.barberId, targetDate);
-      if (slots.includes(t)) return await commitChosen({ date: targetDate, time: t }, forReschedule);
-      // ocupada → negociar (máximo 2 rondas, REGLA de horarios)
-      d.negotiation = (d.negotiation || 0) + 1;
-      if (d.negotiation > 2) {
-        resetData();
-        return out(`No logramos cuadrar la hora 😕 Mejor elige directo en el calendario: ${linkOnce()}`, 'idle');
-      }
-      const near = nearestSlots(slots, t, 2);
-      if (!near.length) return await offerSlots(forReschedule);
-      d.offered = near.map(x => ({ date: targetDate, time: x }));
-      return out(`Las ${formatTime(t)} está ocupada 😕 Tengo ${joinNatural(near.map(formatTime), 'o')}, ¿cuál te sirve?`);
+      return await confirmSlot(targetDate, t, forReschedule);
     }
-    // 4. Solo fecha (sin hora) → mostrar ese día
+    // 3. Solo fecha (sin hora) → mostrar ese día (cupos reales).
     if (understood.date) {
       const targetDate = resolveDateToken(understood.date);
       if (targetDate && daysFromToday(targetDate) > 30) {
         return out(`Solo puedo agendar hasta el *${formatDate(limitDateStr())}* 😊 ¿Qué otra fecha te sirve?`);
       }
-      const slots = targetDate ? await deps.getSlots(bk.barberId, targetDate) : [];
-      if (slots.length) {
-        const pick = spreadSlots(slots, 4);
+      const day = targetDate ? await deps.getDayAvailability(bk.barberId, targetDate) : null;
+      if (day && !day.closed && day.available.length) {
+        const pick = spreadSlots(day.available, 4);
         d.offered = pick.map(x => ({ date: targetDate, time: x }));
         return out(`📅 *${displayDay(targetDate)}*:\n- ${pick.map(formatTime).join(' • ')}\n\n¿Cuál te queda bien?`);
       }
       d.negotiation = (d.negotiation || 0) + 1;
       if (d.negotiation > 2) { resetData(); return out(`Mejor elige en el calendario: ${linkOnce()}`, 'idle'); }
-      return await offerSlots(forReschedule);
+      return await offerSlots(forReschedule, day && day.closed ? `Ese día ${bk.barberName} no abre 😕` : null);
     }
-    // 5. No entendido → re-preguntar (dedupe garantiza que no repita literal)
+    // 4. No entendido → re-preguntar (dedupe garantiza que no repita literal)
     return out(`¿Cuál de esos horarios te queda bien? También puedes decirme una hora y te verifico 🙂`);
   }
 
@@ -351,28 +394,12 @@ async function respond({ session, msg, understood, ctx, deps }) {
       return out(`Me falta ${joinNatural(missing)} 🙂${extra}`, 'collecting');
     }
 
-    // Todo recolectado. ¿Pidió día+hora concretos? Verificar e ir directo a confirmar.
+    // Todo recolectado. ¿Pidió día+hora concretos? Verificar SIEMPRE contra la DB.
     if (bk.wantDate && bk.wantTime) {
-      if (daysFromToday(bk.wantDate) > 30) {
-        bk.wantDate = null;
-        return out(`Solo puedo agendar hasta el *${formatDate(limitDateStr())}* 😊 ¿Qué fecha te sirve?`, 'picking_slot');
-      }
-      const slots = await deps.getSlots(bk.barberId, bk.wantDate);
-      if (slots.includes(bk.wantTime)) {
-        const chosen = { date: bk.wantDate, time: bk.wantTime };
-        bk.wantDate = null; bk.wantTime = null;
-        return await commitChosen(chosen, false);
-      }
-      // pidió hora puntual no disponible → negociar con las más cercanas
-      const near = nearestSlots(slots, bk.wantTime, 2);
-      const wt = bk.wantTime; bk.wantTime = null;
-      if (near.length) {
-        d.offered = near.map(x => ({ date: bk.wantDate, time: x }));
-        d.negotiation = 1;
-        session.state = 'picking_slot';
-        return out(`Las ${formatTime(wt)} está ocupada 😕 Tengo ${joinNatural(near.map(formatTime), 'o')}, ¿cuál te sirve?`);
-      }
-      bk.wantDate = null;
+      const wd = bk.wantDate, wt = bk.wantTime, amb = bk.wantTimeAmbiguous;
+      bk.wantDate = null; bk.wantTime = null; bk.wantTimeAmbiguous = false;
+      if (amb) return ampmAsk(wd, false);          // AM/PM ambiguo → preguntar una vez
+      return await confirmSlot(wd, wt, false);     // chokepoint: verifica vs DB
     }
     return await offerSlots(false);
   }
@@ -491,6 +518,13 @@ async function respond({ session, msg, understood, ctx, deps }) {
   if (session.state === 'idle') {
     const active = history && history.activeAppointment;
     const hasData = !!(understood.service || understood.name || understood.barber || understood.time || understood.date);
+
+    // Filtro de relevancia: en reposo, un mensaje claramente ajeno a la barbería
+    // se corta UNA vez. (En flujos activos no se llega aquí; allí un mensaje corto
+    // se interpreta como respuesta al flujo antes de descartarlo.)
+    if (I === 'FUERA_DE_CONTEXTO' && !hasData) {
+      return out(`Solo puedo ayudarte con citas en *${ctx.business.name}* 😊\n📅 Reserva aquí: ${linkOnce()}`);
+    }
 
     // ── CASO A: cliente con cita activa ──────────────────────────────────────
     if (active) {
