@@ -1,137 +1,129 @@
-// Offline simulation (uses the REAL booking-logic.js). LLM extraction, getSlots
-// and getUpcoming are mocked. Verifies: questions answered mid-flow, OFFER instead
-// of ask, no identical repeats. Run: node test-booking-sim.js
+// Simulación offline del NUEVO motor (booking-logic.respond).
+// Groq (understood), disponibilidad y commits están mockeados.
+// Verifica los 5 casos del rediseño + conteo de mensajes del bot.
+// Run: node test-booking-sim.js
 const bl = require('./booking-logic');
 
+const business = { name: 'Annlo Barbería', slug: 'annlo' };
+const bookingLink = 'https://spaceyreserve.netlify.app/book/annlo';
 const services = [
   { id: 's1', name: 'Corte moderno', price: 25, duration_minutes: 30 },
   { id: 's2', name: 'Barba', price: 24, duration_minutes: 20 },
-  { id: 's3', name: 'tinte de pelo', price: 45, duration_minutes: 60 },
+  { id: 's3', name: 'Tinte de pelo', price: 45, duration_minutes: 60 },
   { id: 's4', name: 'Cejas', price: 5, duration_minutes: 10 },
 ];
-// Solo barberos CON horario (Loann queda fuera, como en producción tras el filtro)
-const barbers = [{ id: 'b1', name: 'pepe' }, { id: 'b2', name: 'pablo' }, { id: 'b3', name: 'Pacheco' }];
+const barbers = [{ id: 'b1', name: 'Pepe' }, { id: 'b2', name: 'Pablo' }, { id: 'b3', name: 'Pacheco' }];
 
 const today = bl.todayPR();
-const tomorrow = (() => { const d = new Date(today + 'T12:00:00'); d.setDate(d.getDate() + 1); return d.toISOString().split('T')[0]; })();
+const addDays = (n) => { const d = new Date(today + 'T12:00:00'); d.setDate(d.getDate() + n); return d.toISOString().split('T')[0]; };
+const tomorrow = addDays(1);
+const day3 = addDays(2);
+
+// Disponibilidad por barbero/fecha
 const SLOTS = {
-  Pacheco: { [today]: ['14:30', '16:00'], [tomorrow]: ['09:00', '10:00', '11:00'] },
-  pepe: { [tomorrow]: ['09:00', '11:00'] },
-  pablo: { [today]: ['10:00', '12:00'], [tomorrow]: ['09:00'] },
+  b1: { [today]: ['15:00', '16:30'], [tomorrow]: ['10:00', '11:00', '14:00'], [day3]: ['09:00', '13:00'] },
+  b2: { [tomorrow]: ['09:00', '12:00'] },
+  b3: { [today]: ['14:30', '16:00'], [tomorrow]: ['09:00', '10:00', '11:00'] },
 };
-const nameOf = (id) => (barbers.find(b => b.id === id) || {}).name;
-async function getSlots(barberId, date) { return (SLOTS[nameOf(barberId)] || {})[date] || []; }
-async function getUpcoming(barberId) {
+async function getSlots(barberId, date) { return (SLOTS[barberId] || {})[date] || []; }
+async function getUpcoming(barberId, maxDays = 2, perDay = 2) {
   const out = [];
-  for (let off = 0; off <= 5 && out.length < 2; off++) {
-    const d = new Date(today + 'T12:00:00'); d.setDate(d.getDate() + off);
+  const base = new Date(today + 'T12:00:00');
+  for (let off = 0; off <= 13 && out.length < maxDays; off++) {
+    const d = new Date(base); d.setDate(base.getDate() + off);
     const ds = d.toISOString().split('T')[0];
-    const s = await getSlots(barberId, ds);
-    if (s.length) out.push({ date: ds, slots: s.slice(0, 2) });
+    const slots = await getSlots(barberId, ds);
+    if (slots.length) {
+      const pick = []; const step = Math.max(1, Math.floor(slots.length / perDay));
+      for (let i = 0; i < slots.length && pick.length < perDay; i += step) pick.push(slots[i]);
+      out.push({ date: ds, slots: pick });
+    }
   }
   return out;
 }
 
-const seen = [];
-function makeBot() {
-  const session = { state: 'idle', data: {} };
-  const GREET = ['hola', 'buenas', 'hey']; const BW = ['cita', 'reservar', 'agendar'];
-  async function decide(t, ex) { return bl.decideBookingReply({ session, msg: t, extracted: ex || {}, services, barbers, getSlots, getUpcoming }); }
-  async function send(t, ex) {
-    const m = t.toLowerCase();
-    if (session.state === 'idle') {
-      const looks = bl.looksLikeBooking(t, services);
-      if (GREET.some(g => m.split(/\s+/).includes(g)) || BW.some(w => m.includes(w)) || looks) {
-        session.state = 'booking'; session.data.bk = {};
-        if (looks || bl.hasBookingContent(t, services, barbers, GREET, BW)) return await decide(t, ex);
-        session.data.awaiting = ['name', 'service', 'date', 'time'];
-        return `Bienvenido 💈 Mándame en un mensaje: tu nombre, el servicio y el día y la hora.`;
-      }
-    }
-    if (session.state === 'booking') return await decide(t, ex);
-    if (session.state === 'confirm') {
-      const n = m.replace(/[áéíóú]/g, c => 'aeiou'['áéíóú'.indexOf(c)]);
-      if (/^(si|dale|ok|confirmo|listo|va)\b/.test(n)) {
-        const bk = session.data.bk; const r = `✅ ¡Listo, ${bk.name}! ${bk.serviceName} con ${bk.barberName}, ${bl.formatDate(bk.date)} ${bl.formatTime(bk.time)}.`;
-        session.state = 'idle'; session.data = {}; return r;
-      }
-      session.state = 'booking'; return `Dime el dato correcto 🙂`;
-    }
-  }
-  return { send, repeated: () => seen };
+// "DB" en memoria para reagendar/cancelar
+let DB = [];
+function makeDeps() {
+  return {
+    getSlots, getUpcoming,
+    getActiveAppointments: async () => DB.filter(a => a.status === 'confirmed' && a.appointment_date >= today)
+      .sort((a, b) => (a.appointment_date < b.appointment_date ? -1 : 1)),
+    commitCreate: async (bk) => { DB.push({ id: 'new' + DB.length, status: 'confirmed', customer_name: bk.name, appointment_date: bk.date, start_time: bk.startTime, barber_id: bk.barberId, service_id: bk.serviceId }); return { ok: true }; },
+    commitReschedule: async (id, date, time) => { const a = DB.find(x => x.id === id); if (a) { a.appointment_date = date; a.start_time = time; } return { ok: true }; },
+    commitCancel: async (id) => { const a = DB.find(x => x.id === id); if (a) a.status = 'cancelled'; return { ok: true }; },
+    askGeneral: async () => '(respuesta general de Groq)',
+  };
 }
 
-async function run(title, turns) {
+function makeBot(history) {
+  const session = { state: 'idle', data: {} };
+  const deps = makeDeps();
+  return {
+    session,
+    send: (msg, understood) => bl.respond({ session, msg, understood: understood || { intent: 'UNKNOWN' }, ctx: { business, services, barbers, bookingLink, history: history || { hasHistory: false }, phone: '+17875551234' }, deps }),
+  };
+}
+
+async function run(title, history, turns) {
   console.log('\n══════════════════════════════════════════\n' + title + '\n══════════════════════════════════════════');
-  const bot = makeBot(); let last = null; let repeat = false;
-  for (const [t, ex] of turns) {
-    console.log(`👤 ${t}`);
-    const r = await bot.send(t, ex);
-    if (r === last) repeat = true;
+  const bot = makeBot(history);
+  let last = null, repeated = false, botMsgs = 0;
+  for (const [msg, understood] of turns) {
+    console.log(`👤 ${msg}`);
+    const r = await bot.send(msg, understood);
+    botMsgs++;
+    if (r === last) repeated = true;
     last = r;
-    console.log(`🤖 ${r}`);
+    console.log(`🤖 ${r}\n`);
   }
-  console.log(repeat ? '   ⚠️  REPITIÓ un mensaje idéntico' : '   ✓ sin repeticiones idénticas');
+  console.log(`   → ${botMsgs} mensajes del bot · estado final: ${bot.session.state}` + (repeated ? ' · ⚠️ REPITIÓ' : ' · ✓ sin repeticiones'));
+  return { botMsgs, repeated, state: bot.session.state, session: bot.session };
 }
 
 (async () => {
-  await run('REPRO del transcript: buenas soy Loann... que dia tienes → con pacheco → elige', [
-    ['buenas soy Loann quiero el corte moderno y que dia tienes', { service: 'Corte moderno' }],
-    ['quiero con pacheco', {}],
-    ['que dias tienes', {}],
-    ['mañana a las 9', {}],
-    ['sí', {}],
+  // CASO 1 — Cliente nuevo da TODO en un mensaje (incluida la hora) → 2-3 mensajes
+  DB = [];
+  await run('CASO 1 — nuevo, todo en un mensaje (con hora libre)', { hasHistory: false }, [
+    ['Hola, soy Ana, corte moderno con Pepe mañana a las 10', { intent: 'NUEVA_CITA', name: 'Ana', service: 'Corte moderno', barber: 'Pepe', date: 'tomorrow', time: '10:00' }],
+    ['sí, confirmo', { intent: 'CONFIRMAR' }],
   ]);
 
-  await run('1) "¿qué horarios tiene pepe mañana?" → ofrece los horarios de pepe', [
-    ['¿qué horarios tiene pepe mañana?', {}],
+  // CASO 2 — Cliente nuevo poco a poco → máximo 5
+  DB = [];
+  await run('CASO 2 — nuevo, poco a poco', { hasHistory: false }, [
+    ['hola', { intent: 'UNKNOWN' }],
+    ['soy Ana, quiero corte moderno', { intent: 'NUEVA_CITA', name: 'Ana', service: 'Corte moderno' }],
+    ['con Pepe', { intent: 'NUEVA_CITA', barber: 'Pepe' }],
+    ['mañana a las 11', { intent: 'NUEVA_CITA', date: 'tomorrow', time: '11:00' }],
+    ['dale', { intent: 'CONFIRMAR' }],
   ]);
 
-  await run('2) "¿cuánto cuesta el tinte?" a mitad del flujo → responde y retoma', [
-    ['soy carlos, corte moderno con pacheco', { service: 'Corte moderno' }],
-    ['¿cuánto cuesta el tinte?', {}],
+  // CASO 3 — pide hora NO mostrada → está libre → confirma
+  DB = [];
+  await run('CASO 3 — pide hora libre fuera de la lista', { hasHistory: false }, [
+    ['hola soy Leo, corte moderno con Pepe', { intent: 'NUEVA_CITA', name: 'Leo', service: 'Corte moderno', barber: 'Pepe' }],
+    ['mejor mañana a las 2pm', { intent: 'NUEVA_CITA', date: 'tomorrow', time: '14:00' }],
+    ['perfecto', { intent: 'CONFIRMAR' }],
   ]);
 
-  await run('3) Da todo menos hora + pregunta disponibilidad → ofrece y cierra al siguiente', [
-    ['soy carlos, corte moderno con pepe mañana, qué horas tienes', { service: 'Corte moderno' }],
-    ['a las 9', {}],
-    ['sí', {}],
+  // CASO 4 — pide hora OCUPADA → ofrece 2 cercanas → elige → confirma
+  DB = [];
+  await run('CASO 4 — pide hora ocupada → negocia 2 cercanas', { hasHistory: false }, [
+    ['hola soy Mia, corte moderno con Pepe', { intent: 'NUEVA_CITA', name: 'Mia', service: 'Corte moderno', barber: 'Pepe' }],
+    ['mañana a las 12', { intent: 'NUEVA_CITA', date: 'tomorrow', time: '12:00' }],
+    ['las 11 entonces', { intent: 'NUEVA_CITA', time: '11:00' }],
+    ['sí', { intent: 'CONFIRMAR' }],
   ]);
 
-  // ── COMMIT 3: Límite de 30 días ───────────────────────────────────────────
-  await run('COMMIT 3 — fecha > 30 días → rechaza y ofrece ventana válida', [
-    // Simula que el LLM devuelve una fecha de hace mucho tiempo en el futuro (> 30 días)
-    // resolveDateToken no maneja "20 de agosto" así que usamos una fecha ISO directa
-    ['soy Ana, corte moderno con pepe', { service: 'Corte moderno', name: 'Ana' }],
-    // Ahora el "LLM" extrae una fecha que está a 60 días
-    ['el', { date: (() => { const d = new Date(bl.todayPR() + 'T12:00:00'); d.setDate(d.getDate() + 60); return d.toISOString().split('T')[0]; })() }],
-    // Cliente responde con una fecha válida
-    ['mañana', {}],
-    ['a las 9', {}],
-    ['sí', {}],
+  // CASO 5 — Cliente conocido reagenda → máximo 4
+  DB = [{ id: 'ap1', status: 'confirmed', customer_name: 'Carlos', appointment_date: tomorrow, start_time: '10:00', barber_id: 'b1', service_id: 's1' }];
+  const history5 = { hasHistory: true, name: 'Carlos', activeAppointment: { appointment_date: tomorrow, start_time: '10:00', barber_id: 'b1', service_id: 's1' } };
+  const r5 = await run('CASO 5 — conocido reagenda', history5, [
+    ['hola', { intent: 'UNKNOWN' }],
+    ['quiero reagendar', { intent: 'REAGENDAR' }],
+    ['sí', { intent: 'CONFIRMAR' }],
+    ['mañana a las 11', { intent: 'NUEVA_CITA', date: 'tomorrow', time: '11:00' }],
   ]);
-
-  // ── COMMIT 1: Reconocimiento de cliente (simulado con helpers de booking-logic) ──
-  console.log('\n══════════════════════════════════════════');
-  console.log('COMMIT 1 — RECONOCIMIENTO: lo_de_siempre pre-fill');
-  console.log('══════════════════════════════════════════');
-  // Simula el estado que crea el handler lo_de_siempre tras decir "sí"
-  {
-    const session = { state: 'booking', data: {
-      bk: { name: 'Carlos', serviceId: 's1', serviceName: 'Corte moderno', serviceDuration: 30, servicePrice: 25, barberId: 'b3', barberName: 'Pacheco' },
-      awaiting: ['date', 'time'],
-      bk_offeredSlots: null,
-    }};
-    // Simula que el usuario elige el slot ofrecido
-    const up = await getUpcoming('b3');
-    const offered = [];
-    for (const g of up) for (const t of g.slots) offered.push({ date: g.date, time: t });
-    session.data.bk.offeredSlots = offered;
-    console.log('👤 [bot ya mostró slots de Pacheco — cliente responde:]');
-    console.log('👤 mañana a las 9');
-    const r = await bl.decideBookingReply({ session, msg: 'mañana a las 9', extracted: { date: 'tomorrow', time: '09:00' }, services, barbers, getSlots, getUpcoming });
-    console.log(`🤖 ${r}`);
-    const v = session.state === 'confirm' ? '✓ estado=confirm' : '⚠️ estado=' + session.state;
-    console.log(`   ${v} — bk.date=${session.data.bk?.date} bk.time=${session.data.bk?.time}`);
-  }
+  console.log('   → cita en DB tras reagendar:', JSON.stringify(DB[0].start_time), '(debe ser 11:00, NO duplicada — DB len ' + DB.length + ')');
 })();
