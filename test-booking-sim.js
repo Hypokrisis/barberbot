@@ -260,13 +260,25 @@ async function run(title, history, turns) {
   check('confirma 1:00 PM en el primer día disponible', b.session.data.lastReply.includes('1:00 PM') && b.session.data.lastReply.includes('¿Confirmo?'));
 
   DB = [{ id: 'ap2', status: 'confirmed', customer_name: 'Rita', appointment_date: tomorrow, start_time: '10:00', barber_id: 'b2', service_id: 's1' }];
-  b = await run('C19 — BUG2: "qué horarios tienes" en reschedule → mismo barbero, próximos días', histB2, [
+  b = await run('C19 — "qué horarios tienes" tras mostrarlos → NO repite el bloque', histB2, [
     ['reagendar', { intent: 'REAGENDAR' }],
-    ['sí', { intent: 'CONFIRMAR' }],
+    ['sí', { intent: 'CONFIRMAR' }],                      // → muestra horarios (1er bloque)
     ['qué horarios tienes', { intent: 'PREGUNTA_GENERAL' }],
   ]);
-  check('re-muestra horarios de Pablo (no pierde barbero)', b.session.data.lastReply.includes('Pablo') && b.session.data.lastReply.includes('tiene espacio:'));
-  check('NO salta a hoy / "ya pasó"', !b.session.data.lastReply.includes('ya pasó'));
+  check('responde "Ya te mostré los horarios disponibles"', b.session.data.lastReply.includes('Ya te mostré los horarios disponibles'));
+  check('NO re-vuelca el bloque ("tiene espacio:")', !b.session.data.lastReply.includes('tiene espacio:'));
+  check('pide día/hora específica', b.session.data.lastReply.includes('día o hora específica'));
+
+  // Refuerzo de la regla irrompible: dos "qué horarios" seguidos nunca dan texto idéntico.
+  DB = [{ id: 'ap2', status: 'confirmed', customer_name: 'Rita', appointment_date: tomorrow, start_time: '10:00', barber_id: 'b2', service_id: 's1' }];
+  {
+    const bot = makeBot(histB2);
+    await bot.send('reagendar', { intent: 'REAGENDAR' });
+    await bot.send('sí', { intent: 'CONFIRMAR' });
+    const m1 = await bot.send('qué horarios tienes', { intent: 'PREGUNTA_GENERAL' });
+    const m2 = await bot.send('y qué horarios tienes', { intent: 'PREGUNTA_GENERAL' });
+    check('C19b — dos consultas seguidas NO devuelven texto idéntico', m1 !== m2);
+  }
 
   DB = [];
   b = await run('C20 — BUG3: "para el día 3 qué tienes" → lista numerada de ese día', { hasHistory: false }, [

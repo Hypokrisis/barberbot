@@ -389,8 +389,13 @@ async function respond({ session, msg, understood, ctx, deps }) {
       if (d.negotiation > 2) { resetData(); return out(`Mejor elige en el calendario: ${linkOnce()}`, 'idle'); }
       return await offerSlots(forReschedule, day && day.closed ? `Ese día ${bk.barberName} no abre 😕` : null);
     }
-    // 4. Sin hora/día/elección (ej "qué horarios tienes") → RE-MOSTRAR los próximos
-    //    días del MISMO barbero, sin perder contexto ni saltar a hoy (BUG 2).
+    // 4. Sin hora/día/elección (ej "qué horarios tienes"):
+    //    - Si YA le mostramos horarios → NO repetir el bloque (regla irrompible
+    //      "nunca repetir el mismo mensaje"); pedir un día/hora específico.
+    //    - Si aún no hay nada mostrado → mostrar los próximos días del barbero.
+    if (offered.length) {
+      return out(`Ya te mostré los horarios disponibles 🙂\n¿Hay algún día o hora específica que prefieras?`);
+    }
     return await offerSlots(forReschedule);
   }
 
