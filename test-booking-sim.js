@@ -149,12 +149,14 @@ async function run(title, history, turns) {
   check('bloquea con "una cita activa a la vez"', b.session.data.lastReply.includes('una cita activa a la vez'));
 
   DB = [{ id: 'ap1', status: 'confirmed', customer_name: 'Carlos', appointment_date: tomorrow, start_time: '10:00', barber_id: 'b1', service_id: 's1' }];
-  b = await run('C5 — REAGENDAR completo (UPDATE, no duplica)', histActive, [
+  b = await run('C5 — REAGENDAR con paso de confirmación (UPDATE, no duplica)', histActive, [
     ['hola', { intent: 'UNKNOWN' }],
-    ['reagendar', { intent: 'REAGENDAR' }],
+    ['reagendar', { intent: 'REAGENDAR' }],           // → "¿La cambiamos? (sí/no)"
+    ['sí', { intent: 'CONFIRMAR' }],                  // → muestra horarios
     ['el día 3 a las 1pm', { intent: 'NUEVA_CITA', date: day3, time: '13:00' }],
-    ['sí', { intent: 'CONFIRMAR' }],
+    ['sí', { intent: 'CONFIRMAR' }],                  // → UPDATE
   ]);
+  check('reagendar pidió confirmar el cambio', b.session.state === 'idle');
   check('UPDATE: 1 fila, id ap1, día3 13:00', DB.length === 1 && DB[0].id === 'ap1' && DB[0].appointment_date === day3 && DB[0].start_time === '13:00');
 
   const histRec = { hasHistory: true, name: 'Loann', activeAppointment: null };
@@ -212,6 +214,33 @@ async function run(title, history, turns) {
     ['nah', { intent: 'NEGAR' }],
   ]);
   check('mid-flujo NO suelta el mensaje fijo', !b.session.data.lastReply.includes('Solo puedo ayudarte con citas'));
+
+  // ── Copy del spec final ────────────────────────────────────────────────────
+  DB = [];
+  b = await run('C14 — Bienvenida (CASO C) con el formato del spec', { hasHistory: false }, [
+    ['hola', { intent: 'UNKNOWN' }],
+  ]);
+  check('empieza con "¡Bienvenido a Annlo Barber!"', b.session.data.lastReply.startsWith('¡Bienvenido a *Annlo Barber*!'));
+  check('incluye las 4 líneas que debe pedir', /- Tu nombre[\s\S]*- El servicio[\s\S]*- El barbero[\s\S]*- El día y hora/.test(b.session.data.lastReply));
+
+  DB = [];
+  b = await run('C15 — Horarios en formato "tiene espacio / HOY — ..."', { hasHistory: false }, [
+    ['soy Tom corte moderno con Pepe', { intent: 'NUEVA_CITA', name: 'Tom', service: 'Corte moderno', barber: 'Pepe' }],
+  ]);
+  check('encabezado "tiene espacio:"', b.session.data.lastReply.includes('tiene espacio:'));
+  check('día con separador "—"', /(HOY|MAÑANA|[A-ZÁÉÍÓÚ]+) — /.test(b.session.data.lastReply));
+
+  DB = [];
+  b = await run('C16 — Pregunta general (CASO C) → respuesta + seguimiento', { hasHistory: false }, [
+    ['cuál es la dirección?', { intent: 'PREGUNTA_GENERAL' }],
+  ]);
+  check('cierra con "¿Puedo ayudarte con algo más?"', b.session.data.lastReply.includes('¿Puedo ayudarte con algo más?'));
+
+  DB = [{ id: 'ap1', status: 'confirmed', customer_name: 'Carlos', appointment_date: tomorrow, start_time: '10:00', barber_id: 'b1', service_id: 's1' }];
+  b = await run('C17 — Reagendar: primer paso pregunta "¿La cambiamos?"', histActive, [
+    ['quiero reagendar', { intent: 'REAGENDAR' }],
+  ]);
+  check('pregunta "¿La cambiamos?"', b.session.data.lastReply.includes('¿La cambiamos?'));
 
   console.log('\n══════════════════════════════════════════');
   console.log(FAILED === 0 ? '✅ TODOS LOS CHECKS PASARON' : `❌ ${FAILED} CHECK(S) FALLARON`);

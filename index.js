@@ -379,6 +379,7 @@ async function understand(message, services, barbers, state, offeredCtx, hoursCt
 {"intent":"NUEVA_CITA|REAGENDAR|CANCELAR|VER_CITA|CONFIRMAR|NEGAR|PREGUNTA_GENERAL|FUERA_DE_CONTEXTO|UNKNOWN","name":string|null,"service":string|null,"barber":string|null,"date":string|null,"time":string|null,"choice":number|null,"ampm_ambiguous":boolean}
 
 PASO 1 — ¿el mensaje es sobre la barbería? Relacionado = reservar/reagendar/cancelar, preguntar por servicios/precios/horarios/ubicación/barberos, o una respuesta dentro del flujo activo. NO relacionado = otros temas (clima, matemáticas, etc.), preguntas sobre "Spacey Reserve" como plataforma, spam, o números/saludos raros sin flujo activo → intent="FUERA_DE_CONTEXTO".
+IMPORTANTE: un saludo ("hola","buenas","qué tal","hey") o preguntar por disponibilidad/horarios/precios/servicios SIEMPRE es sobre la barbería — NUNCA lo marques FUERA_DE_CONTEXTO (usa UNKNOWN, PREGUNTA_GENERAL o NUEVA_CITA).
 ${inFlow ? 'OJO: el cliente está EN MEDIO de un flujo activo. Un mensaje corto o ambiguo ("nah","ese","las 6","ok","el azul") casi siempre es una respuesta al flujo — interprétalo como tal ANTES de marcarlo FUERA_DE_CONTEXTO. Solo usa FUERA_DE_CONTEXTO si es CLARAMENTE ajeno (ej "ayúdame con mate").' : ''}
 
 intent (si es sobre la barbería):

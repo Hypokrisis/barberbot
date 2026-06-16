@@ -214,11 +214,11 @@ async function respond({ session, msg, understood, ctx, deps }) {
   // ── Textos de bienvenida / saludo (CASO A / B / C) ──────────────────────────
   function welcomeText() {
     // CASO C — cliente nuevo
-    return `¡Bienvenido! 💈 Soy el asistente de *${ctx.business.name}*.\n\n` +
+    return `¡Bienvenido a *${ctx.business.name}*! 💈\n` +
+           `Para tu cita dime:\n- Tu nombre\n- El servicio que quieres\n- El barbero que prefieres\n- El día y hora aproximada\n\n` +
            `✂️ *Servicios:*\n${svcListText()}\n\n` +
            `💈 *Equipo:*\n${barberListText()}\n\n` +
-           `Dime tu nombre, el servicio y el barbero 😊\n` +
-           `📅 O reserva: ${linkOnce()}`;
+           `📅 O reserva directo: ${linkOnce()}`;
   }
   function recurringText() {
     // CASO B — recurrente sin cita activa (nombre ya conocido → no se pide)
@@ -254,16 +254,15 @@ async function respond({ session, msg, understood, ctx, deps }) {
     }
     d.offered = [];
     const blocks = [];
-    up.forEach((g, gi) => {
+    up.forEach((g) => {
       for (const t of g.slots) d.offered.push({ date: g.date, time: t });
-      const hd = gi === 0 ? `*${displayDay(g.date)}* (${shortDate(g.date)})` : `*${displayDay(g.date)}*`;
-      blocks.push(`${hd}\n- ${g.slots.map(formatTime).join(' • ')}`);
+      blocks.push(`${displayDay(g.date).toUpperCase()} — ${g.slots.map(formatTime).join(', ')}`);
     });
     d.negotiation = 0;
     return out(
-      `${head}📅 *${bk.barberName}* disponible:\n\n${blocks.join('\n\n')}\n\n` +
-      `¿Cuál te queda bien?\nSi no ves una que te sirva, dime la hora que prefieres y te verifico 😊\n` +
-      `📅 O elige en el calendario: ${linkOnce()}`,
+      `${head}📅 *${bk.barberName}* tiene espacio:\n${blocks.join('\n')}\n\n` +
+      `¿Cuál te queda bien?\nSi quieres otra hora, dímela y te verifico 😊\n` +
+      `📅 O elige aquí: ${linkOnce()}`,
       nextState
     );
   }
@@ -405,7 +404,8 @@ async function respond({ session, msg, understood, ctx, deps }) {
   }
 
   // ── Acciones sobre la cita existente ────────────────────────────────────────
-  // REAGENDAR: carga la cita activa y muestra horarios directo (sin paso extra).
+  // REAGENDAR: 1) muestra la cita y pregunta si la cambiamos, 2) al confirmar →
+  // muestra horarios (offerSlots). El UPDATE ocurre tras elegir + confirmar.
   async function startReschedule() {
     const appts = await deps.getActiveAppointments();
     if (!appts.length) {
@@ -423,7 +423,11 @@ async function respond({ session, msg, understood, ctx, deps }) {
     if (sv) setService(d.bk, sv);
     setBarber(d.bk, ba);
     d.reschedule = { apptId: a.id };
-    return await offerSlots(true); // → estado rescheduling, muestra horarios
+    d.pendingAction = 'reschedule_start';
+    return out(
+      `Tienes ${sv ? sv.name : 'tu servicio'} con ${ba.name} el ${formatDate(a.appointment_date)} a las ${formatTime(a.start_time)}.\n¿La cambiamos? (sí/no)`,
+      'confirming'
+    );
   }
 
   // CANCELAR: pide confirmación clara.
@@ -464,8 +468,10 @@ async function respond({ session, msg, understood, ctx, deps }) {
     let affirm = I === 'CONFIRMAR' || rawNum === 1;
     let negate = I === 'NEGAR' || rawNum === 2;
     if (action === 'cancel') affirm = affirm || I === 'CANCELAR';
+    if (action === 'reschedule_start') affirm = affirm || I === 'REAGENDAR';
 
     if (affirm) {
+      if (action === 'reschedule_start') return await offerSlots(true); // → horarios
       if (action === 'create') {
         const bk = d.bk;
         const endTime = addDuration(bk.time, bk.serviceDuration);
@@ -493,13 +499,14 @@ async function respond({ session, msg, understood, ctx, deps }) {
     }
     if (negate) {
       if (action === 'create') return out(`Claro, dime el dato correcto (servicio, día u hora) 🙂`, 'collecting');
-      if (action === 'reschedule') { resetData(); return out(`Sin problema, dejamos tu cita como estaba 💈`, 'idle'); }
+      if (action === 'reschedule' || action === 'reschedule_start') { resetData(); return out(`¡Perfecto! Tu cita se mantiene igual 💈`, 'idle'); }
       // cancel negativo
       resetData();
       return out(`¡Perfecto, te esperamos! 💈`, 'idle');
     }
     // Ambiguo: preguntar UNA vez más, distinto. NUNCA ejecutar lo opuesto.
     if (action === 'cancel') return out(`Solo para estar seguro 🙂 ¿cancelo tu cita? Responde *sí* o *no*.`);
+    if (action === 'reschedule_start') return out(`¿Quieres cambiar tu cita? Responde *sí* o *no* 🙂`);
     if (action === 'reschedule') return out(`¿Confirmo el cambio a las ${formatTime(d.bk.time)}? Responde *sí* o *no* 🙂`);
     // create: si cambió un detalle (otra hora/día/servicio/barbero) → re-evaluar
     if (understood.time || understood.date || understood.service || understood.barber) {
@@ -530,8 +537,7 @@ async function respond({ session, msg, understood, ctx, deps }) {
     if (active) {
       // Acuse del recordatorio ("confirmo" sobre una cita ya existente)
       if (I === 'CONFIRMAR') {
-        const ba = barbers.find(b => b.id === active.barber_id);
-        return out(`✅ ¡Perfecto, ${history.name}! Tu cita sigue en pie.\n💈 ${ba ? ba.name : 'Tu barbero'} te espera el ${formatDate(active.appointment_date)} a las ${formatTime(active.start_time)}. ¡Nos vemos! 🙌`);
+        return out(`✅ ¡Perfecto! Te esperamos a las ${formatTime(active.start_time)} 💈`);
       }
       // REGLA #1: pide nueva cita o manda datos de reserva → no se crea otra.
       if (I === 'NUEVA_CITA' || hasData) {
@@ -557,9 +563,10 @@ async function respond({ session, msg, understood, ctx, deps }) {
     }
 
     // CASO C — cliente nuevo
-    // Pregunta general informativa (sin datos de cita) → responder y quedarse.
+    // Pregunta general informativa (sin datos de cita) → responder y retomar.
     if (I === 'PREGUNTA_GENERAL' && !hasData) {
-      return await deps.askGeneral(msg);
+      const ans = await deps.askGeneral(msg);
+      return out(`${ans}\n\n¿Puedo ayudarte con algo más? 🙂`);
     }
     if (hasData) { mergeUnderstood(); return await advanceCollecting(); }
     return out(welcomeText(), 'collecting');
