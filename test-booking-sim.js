@@ -1,18 +1,16 @@
-// Simulación offline del NUEVO motor (booking-logic.respond).
+// Simulación offline del motor v4 (booking-logic.respond).
 // Groq (understood), disponibilidad y commits están mockeados.
-// Verifica los 5 casos del rediseño + conteo de mensajes del bot.
-// Run: node test-booking-sim.js
+// Verifica los 5 casos del rediseño FINAL. Run: node test-booking-sim.js
 const bl = require('./booking-logic');
 
-const business = { name: 'Annlo Barbería', slug: 'annlo' };
-const bookingLink = 'https://spaceyreserve.netlify.app/book/annlo';
+const business = { name: 'Annlo Barber', slug: 'annlobarberia' };
+const bookingLink = 'https://spaceyreserve.netlify.app/book/annlobarberia';
 const services = [
   { id: 's1', name: 'Corte moderno', price: 25, duration_minutes: 30 },
   { id: 's2', name: 'Barba', price: 24, duration_minutes: 20 },
   { id: 's3', name: 'Tinte de pelo', price: 45, duration_minutes: 60 },
-  { id: 's4', name: 'Cejas', price: 5, duration_minutes: 10 },
 ];
-const barbers = [{ id: 'b1', name: 'Pepe' }, { id: 'b2', name: 'Pablo' }, { id: 'b3', name: 'Pacheco' }];
+const barbers = [{ id: 'b1', name: 'Pepe' }, { id: 'b2', name: 'Pablo' }];
 
 const today = bl.todayPR();
 const addDays = (n) => { const d = new Date(today + 'T12:00:00'); d.setDate(d.getDate() + n); return d.toISOString().split('T')[0]; };
@@ -23,7 +21,6 @@ const day3 = addDays(2);
 const SLOTS = {
   b1: { [today]: ['15:00', '16:30'], [tomorrow]: ['10:00', '11:00', '14:00'], [day3]: ['09:00', '13:00'] },
   b2: { [tomorrow]: ['09:00', '12:00'] },
-  b3: { [today]: ['14:30', '16:00'], [tomorrow]: ['09:00', '10:00', '11:00'] },
 };
 async function getSlots(barberId, date) { return (SLOTS[barberId] || {})[date] || []; }
 async function getUpcoming(barberId, maxDays = 2, perDay = 2) {
@@ -52,7 +49,7 @@ function makeDeps() {
     commitCreate: async (bk) => { DB.push({ id: 'new' + DB.length, status: 'confirmed', customer_name: bk.name, appointment_date: bk.date, start_time: bk.startTime, barber_id: bk.barberId, service_id: bk.serviceId }); return { ok: true }; },
     commitReschedule: async (id, date, time) => { const a = DB.find(x => x.id === id); if (a) { a.appointment_date = date; a.start_time = time; } return { ok: true }; },
     commitCancel: async (id) => { const a = DB.find(x => x.id === id); if (a) a.status = 'cancelled'; return { ok: true }; },
-    askGeneral: async () => '(respuesta general de Groq)',
+    askGeneral: async () => 'El Corte moderno cuesta $25 y la Barba $24 🙂',
   };
 }
 
@@ -82,48 +79,46 @@ async function run(title, history, turns) {
 }
 
 (async () => {
-  // CASO 1 — Cliente nuevo da TODO en un mensaje (incluida la hora) → 2-3 mensajes
+  // CASO 1 — Cliente nuevo da TODO en un mensaje (incluida la hora) → confirma y listo
   DB = [];
-  await run('CASO 1 — nuevo, todo en un mensaje (con hora libre)', { hasHistory: false }, [
+  await run('CASO 1 — NUEVO, todo en un mensaje (con hora libre)', { hasHistory: false }, [
     ['Hola, soy Ana, corte moderno con Pepe mañana a las 10', { intent: 'NUEVA_CITA', name: 'Ana', service: 'Corte moderno', barber: 'Pepe', date: 'tomorrow', time: '10:00' }],
     ['sí, confirmo', { intent: 'CONFIRMAR' }],
   ]);
+  console.log('   → DB tras crear:', DB.length, 'cita(s) ·', DB[0] && `${DB[0].customer_name} ${DB[0].appointment_date} ${DB[0].start_time}`);
 
-  // CASO 2 — Cliente nuevo poco a poco → máximo 5
+  // CASO 2 — Cliente nuevo da todo POCO A POCO
   DB = [];
-  await run('CASO 2 — nuevo, poco a poco', { hasHistory: false }, [
+  await run('CASO 2 — NUEVO, poco a poco', { hasHistory: false }, [
     ['hola', { intent: 'UNKNOWN' }],
     ['soy Ana, quiero corte moderno', { intent: 'NUEVA_CITA', name: 'Ana', service: 'Corte moderno' }],
     ['con Pepe', { intent: 'NUEVA_CITA', barber: 'Pepe' }],
-    ['mañana a las 11', { intent: 'NUEVA_CITA', date: 'tomorrow', time: '11:00' }],
+    ['el primero', { intent: 'NUEVA_CITA', choice: 1 }],
     ['dale', { intent: 'CONFIRMAR' }],
   ]);
+  console.log('   → DB tras crear:', DB.length, 'cita(s) ·', DB[0] && `${DB[0].customer_name} ${DB[0].appointment_date} ${DB[0].start_time}`);
 
-  // CASO 3 — pide hora NO mostrada → está libre → confirma
-  DB = [];
-  await run('CASO 3 — pide hora libre fuera de la lista', { hasHistory: false }, [
-    ['hola soy Leo, corte moderno con Pepe', { intent: 'NUEVA_CITA', name: 'Leo', service: 'Corte moderno', barber: 'Pepe' }],
-    ['mejor mañana a las 2pm', { intent: 'NUEVA_CITA', date: 'tomorrow', time: '14:00' }],
-    ['perfecto', { intent: 'CONFIRMAR' }],
-  ]);
-
-  // CASO 4 — pide hora OCUPADA → ofrece 2 cercanas → elige → confirma
-  DB = [];
-  await run('CASO 4 — pide hora ocupada → negocia 2 cercanas', { hasHistory: false }, [
-    ['hola soy Mia, corte moderno con Pepe', { intent: 'NUEVA_CITA', name: 'Mia', service: 'Corte moderno', barber: 'Pepe' }],
-    ['mañana a las 12', { intent: 'NUEVA_CITA', date: 'tomorrow', time: '12:00' }],
-    ['las 11 entonces', { intent: 'NUEVA_CITA', time: '11:00' }],
-    ['sí', { intent: 'CONFIRMAR' }],
-  ]);
-
-  // CASO 5 — Cliente conocido reagenda → máximo 4
+  // CASO 3 — Cliente con cita activa escribe "hola" → muestra cita + opciones
   DB = [{ id: 'ap1', status: 'confirmed', customer_name: 'Carlos', appointment_date: tomorrow, start_time: '10:00', barber_id: 'b1', service_id: 's1' }];
-  const history5 = { hasHistory: true, name: 'Carlos', activeAppointment: { appointment_date: tomorrow, start_time: '10:00', barber_id: 'b1', service_id: 's1' } };
-  const r5 = await run('CASO 5 — conocido reagenda', history5, [
+  const histActive = { hasHistory: true, name: 'Carlos', activeAppointment: { appointment_date: tomorrow, start_time: '10:00', barber_id: 'b1', service_id: 's1' } };
+  await run('CASO 3 — CON CITA ACTIVA escribe "hola"', histActive, [
+    ['hola', { intent: 'UNKNOWN' }],
+  ]);
+
+  // CASO 4 — Cliente con cita activa PIDE NUEVA CITA → bloquea y ofrece reagendar/cancelar
+  DB = [{ id: 'ap1', status: 'confirmed', customer_name: 'Carlos', appointment_date: tomorrow, start_time: '10:00', barber_id: 'b1', service_id: 's1' }];
+  await run('CASO 4 — CON CITA ACTIVA pide otra cita (REGLA #1)', histActive, [
+    ['quiero un corte mañana con Pablo', { intent: 'NUEVA_CITA', service: 'Corte moderno', barber: 'Pablo', date: 'tomorrow' }],
+  ]);
+
+  // CASO 5 — Reagendar completo → UPDATE en DB (no duplica)
+  DB = [{ id: 'ap1', status: 'confirmed', customer_name: 'Carlos', appointment_date: tomorrow, start_time: '10:00', barber_id: 'b1', service_id: 's1' }];
+  await run('CASO 5 — REAGENDAR completo', histActive, [
     ['hola', { intent: 'UNKNOWN' }],
     ['quiero reagendar', { intent: 'REAGENDAR' }],
+    ['mejor el día 3 a las 9', { intent: 'NUEVA_CITA', date: day3, time: '09:00' }],
     ['sí', { intent: 'CONFIRMAR' }],
-    ['mañana a las 11', { intent: 'NUEVA_CITA', date: 'tomorrow', time: '11:00' }],
   ]);
-  console.log('   → cita en DB tras reagendar:', JSON.stringify(DB[0].start_time), '(debe ser 11:00, NO duplicada — DB len ' + DB.length + ')');
+  console.log('   → DB len:', DB.length, '(debe ser 1, NO duplicada) · cita:', `${DB[0].appointment_date} ${DB[0].start_time}`, '(debe ser', day3, '09:00)');
+  console.log('     status:', DB[0].status, '· id:', DB[0].id, '(mismo id ap1 = UPDATE, no INSERT)');
 })();

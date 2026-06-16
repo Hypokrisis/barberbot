@@ -312,18 +312,25 @@ async function sendWhatsApp(to, body) {
 
 // ── Groq — "cerebro" del bot: UNA llamada devuelve intención + datos de cita ───
 // Reemplaza classifyIntent + extractBooking (antes 2 llamadas). Sin regex.
-async function understand(message, services, barbers, state) {
+// REGLA #2: el prompt SIEMPRE incluye el estado del bot y lo que se le acaba de
+// mostrar al cliente (las opciones), para que "hoy", "3:30", "el primero" se
+// entiendan en contexto.
+async function understand(message, services, barbers, state, offeredCtx) {
   const svc = services.map(s => s.name).join(', ');
   const bar = barbers.map(b => b.name).join(', ');
   const hint = ({
     collecting:   'El bot está juntando nombre, servicio y barbero. Una palabra suelta suele ser el nombre del cliente o el barbero pedido.',
-    picking_slot: 'El bot ofreció horarios. Un número o una hora es la elección (intent NUEVA_CITA).',
-    rescheduling: 'El bot ofreció horarios para reagendar. Un número o una hora es la elección.',
+    picking_slot: 'El bot ofreció horarios. Un número, una hora o una posición ("el primero") es la elección (intent NUEVA_CITA).',
+    rescheduling: 'El bot ofreció horarios para reagendar. Un número, una hora o una posición ("el primero") es la elección.',
     confirming:   'El bot pidió confirmar (sí/no). "sí/dale/ok/eso/va/perfecto"=CONFIRMAR, "no/mejor no"=NEGAR.',
   })[state] || '';
 
-  const sys = `Eres el cerebro de un bot de citas de barbería en Puerto Rico. Analiza el mensaje y devuelve SOLO JSON:
-{"intent":"NUEVA_CITA|REAGENDAR|CANCELAR|VER_CITA|CONFIRMAR|NEGAR|PREGUNTA_GENERAL|UNKNOWN","name":string|null,"service":string|null,"barber":string|null,"date":string|null,"time":string|null}
+  const offered = offeredCtx
+    ? `\nOpciones que se le acaban de mostrar al cliente (en orden, 1-based): ${offeredCtx}. Si dice "el primero"/"la segunda"/"ese"/"la última", devuelve "choice" con esa posición.`
+    : '';
+
+  const sys = `Eres el cerebro de un bot de citas de barbería en Puerto Rico. Analiza el mensaje EN CONTEXTO y devuelve SOLO JSON:
+{"intent":"NUEVA_CITA|REAGENDAR|CANCELAR|VER_CITA|CONFIRMAR|NEGAR|PREGUNTA_GENERAL|UNKNOWN","name":string|null,"service":string|null,"barber":string|null,"date":string|null,"time":string|null,"choice":number|null}
 
 intent:
 - REAGENDAR: cambiar/mover/reprogramar una cita (ej "cambiar mi cita","no puedo ir a esa hora","hay algo más tarde")
@@ -339,7 +346,8 @@ service: SOLO de esta lista exacta: ${svc}. null si no lo menciona.
 barber: SOLO si pide con quién atenderse (de: ${bar || 'ninguno'}). null si no.
 date: "today","tomorrow", día de semana en español, o YYYY-MM-DD. null si no.
 time: "HH:MM" en 24h. null si no.
-${hint}
+choice: posición 1-based si elige por orden ("el primero"=1,"la segunda"=2). null si no.
+Estado actual del bot: ${state}.${hint ? ' ' + hint : ''}${offered}
 No inventes datos que no estén en el mensaje.`;
 
   try {
@@ -347,12 +355,13 @@ No inventes datos que no estén en el mensaje.`;
       model: 'llama-3.1-8b-instant',
       messages: [{ role: 'system', content: sys }, { role: 'user', content: message }],
       temperature: 0,
-      max_tokens: 160,
+      max_tokens: 180,
       response_format: { type: 'json_object' },
     });
     const j = JSON.parse(c.choices[0].message.content) || {};
     const valid = ['NUEVA_CITA','REAGENDAR','CANCELAR','VER_CITA','CONFIRMAR','NEGAR','PREGUNTA_GENERAL','UNKNOWN'];
     if (!valid.includes(j.intent)) j.intent = 'UNKNOWN';
+    if (!Number.isInteger(j.choice)) j.choice = null;
     return j;
   } catch (e) {
     console.error('[understand] failed:', e.message);
@@ -769,8 +778,17 @@ async function handleMessage(phone, message, businessId) {
   // PASO 0: identificar al cliente por su número (universal: bot / web / dashboard)
   const history = await getClientHistory(phone, businessId);
 
+  // Contexto para Groq (REGLA #2): qué opciones se le mostraron en el turno previo.
+  let offeredCtx = '';
+  if ((session.state === 'picking_slot' || session.state === 'rescheduling')
+      && Array.isArray(session.data?.offered) && session.data.offered.length) {
+    offeredCtx = session.data.offered
+      .map((o, i) => `${i + 1}) ${formatDate(o.date)} ${formatTime(o.time)}`)
+      .join(', ');
+  }
+
   // Groq interpreta TODO el mensaje en UNA sola llamada: intención + datos de cita
-  const understood = await understand(msg, services, barbers, session.state);
+  const understood = await understand(msg, services, barbers, session.state, offeredCtx);
 
   // El motor (booking-logic.js) decide la respuesta y muta la sesión.
   // Toda la I/O entra por `deps` para mantener el motor testeable.
@@ -936,7 +954,7 @@ app.post('/webhook', validateTwilioSignature, async (req, res) => {
   }
 });
 
-app.get('/health', (_, res) => res.json({ status: 'ok', version: '3.0.0-clean-flow' }));
+app.get('/health', (_, res) => res.json({ status: 'ok', version: '4.0.0-final-flow' }));
 
 app.post('/admin/report', async (req, res) => {
   const { type = 'bihourly' } = req.body;
@@ -968,7 +986,7 @@ console.log('✅ Cron jobs registered');
 // ── Server ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
-  console.log('✅ BarberBot v2.2.0-slotfill started');
+  console.log('✅ BarberBot v4.0.0-final-flow started');
   console.log(`🚀 Server running on port ${PORT}`);
 });
 
