@@ -354,6 +354,18 @@ async function sendWhatsApp(to, body) {
   });
 }
 
+// Envía una plantilla aprobada de WhatsApp (necesaria para mensajes iniciados por
+// el negocio fuera de la ventana de 24h, como los recordatorios). `vars` mapea
+// las variables de la plantilla: { "1": ..., "2": ... }.
+async function sendTemplate(to, contentSid, vars) {
+  await twilioClient.messages.create({
+    from: process.env.TWILIO_WHATSAPP_FROM,
+    to: `whatsapp:${to}`,
+    contentSid,
+    contentVariables: JSON.stringify(vars),
+  });
+}
+
 // ── Groq — "cerebro" del bot: UNA llamada devuelve intención + datos de cita ───
 // Reemplaza classifyIntent + extractBooking (antes 2 llamadas). Sin regex.
 // REGLA #2: el prompt SIEMPRE incluye el estado del bot y lo que se le acaba de
@@ -709,6 +721,9 @@ async function sendReminders() {
       const hora = formatTime(apt.start_time);
       const dia = formatDate(apt.appointment_date);
 
+      const link = apt.businesses?.slug ? `https://spaceyreserve.netlify.app/book/${apt.businesses.slug}` : '';
+      const tmpl24 = process.env.TWILIO_TEMPLATE_REMINDER_24H;
+      // Fallback de seguridad: texto libre si aún no hay plantilla configurada.
       const msg =
         `⏰ *Recordatorio de cita — ${businessName}*\n\n` +
         `Hola ${apt.customer_name}, recuerda tu cita mañana:\n` +
@@ -719,7 +734,13 @@ async function sendReminders() {
         `❌ *CANCELAR* — para cancelar la cita`;
 
       try {
-        await sendWhatsApp(apt.customer_phone, msg);
+        if (tmpl24) {
+          await sendTemplate(apt.customer_phone, tmpl24, {
+            '1': apt.customer_name, '2': serviceName, '3': barberName, '4': dia, '5': hora, '6': link,
+          });
+        } else {
+          await sendWhatsApp(apt.customer_phone, msg);
+        }
         await supabase
           .from('appointments')
           .update({ reminder_24h_sent: true })
@@ -742,7 +763,7 @@ async function sendReminders() {
       .select(`
         id, customer_name, customer_phone,
         appointment_date, start_time,
-        barbers(name), businesses(name)
+        barbers(name), services(name), businesses(name, slug)
       `)
       .eq('appointment_date', todayStr)
       .eq('status', 'confirmed')
@@ -756,15 +777,25 @@ async function sendReminders() {
 
       const businessName = apt.businesses?.name || 'tu barbería';
       const barberName = apt.barbers?.name || 'el barbero';
-
+      const serviceName = apt.services?.name || 'tu servicio';
+      const hora = formatTime(apt.start_time);
+      const link = apt.businesses?.slug ? `https://spaceyreserve.netlify.app/book/${apt.businesses.slug}` : '';
+      const tmpl1h = process.env.TWILIO_TEMPLATE_REMINDER_1H;
+      // Fallback de seguridad: texto libre si aún no hay plantilla configurada.
       const msg =
         `⏰ Tu cita es en aproximadamente 1 hora\n\n` +
-        `💈 *${businessName}* · ${formatTime(apt.start_time)}\n` +
+        `💈 *${businessName}* · ${hora}\n` +
         `Con ${barberName}\n\n` +
         `¡Te esperamos!`;
 
       try {
-        await sendWhatsApp(apt.customer_phone, msg);
+        if (tmpl1h) {
+          await sendTemplate(apt.customer_phone, tmpl1h, {
+            '1': apt.customer_name, '2': serviceName, '3': barberName, '4': 'Hoy', '5': hora, '6': link,
+          });
+        } else {
+          await sendWhatsApp(apt.customer_phone, msg);
+        }
         await supabase
           .from('appointments')
           .update({ reminder_30m_sent: true })
@@ -1030,7 +1061,7 @@ app.post('/webhook', validateTwilioSignature, async (req, res) => {
   }
 });
 
-app.get('/health', (_, res) => res.json({ status: 'ok', version: '4.1.0-context-aware' }));
+app.get('/health', (_, res) => res.json({ status: 'ok', version: '4.2.0-spec-aligned' }));
 
 app.post('/admin/report', async (req, res) => {
   const { type = 'bihourly' } = req.body;
@@ -1062,7 +1093,7 @@ console.log('✅ Cron jobs registered');
 // ── Server ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
-  console.log('✅ BarberBot v4.1.0-context-aware started');
+  console.log('✅ BarberBot v4.2.0-spec-aligned started');
   console.log(`🚀 Server running on port ${PORT}`);
 });
 
