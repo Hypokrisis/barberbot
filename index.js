@@ -828,7 +828,7 @@ async function handleMessage(phone, message, businessId) {
       },
       askGeneral: (m) => canUseGroq(business)
         ? askGroq(session, m, business, services)
-        : Promise.resolve(`✂️ Servicios:\n${services.map(s => `• ${s.name} — $${s.price}`).join('\n')}\n\nDime tu nombre, el servicio y el barbero para agendar 🙂`),
+        : Promise.resolve(`¡Bienvenido! 💈 Soy el asistente de ${business.name}.\n\n✂️ Servicios:\n${services.map(s => `• ${s.name} — $${s.price}`).join('\n')}\n\nDime tu nombre, el servicio y el barbero para agendar 🙂`),
     },
   });
 }

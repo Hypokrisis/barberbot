@@ -121,4 +121,24 @@ async function run(title, history, turns) {
   ]);
   console.log('   → DB len:', DB.length, '(debe ser 1, NO duplicada) · cita:', `${DB[0].appointment_date} ${DB[0].start_time}`, '(debe ser', day3, '09:00)');
   console.log('     status:', DB[0].status, '· id:', DB[0].id, '(mismo id ap1 = UPDATE, no INSERT)');
+
+  // CASO 6 — RECURRENTE sin cita activa (+19393167853 = Loann, citas canceladas).
+  // Debe saludar "¡Hola de nuevo, Loann!" AUNQUE Groq lea el saludo como
+  // PREGUNTA_GENERAL (este era el bug: caía al fallback "✂️ Servicios:").
+  DB = [];
+  const histRecurring = { hasHistory: true, name: 'Loann', activeAppointment: null };
+  const expect = (label, txt, ok) => console.log(`   ${ok ? '✅' : '❌'} ${label}` + (ok ? '' : ` — got: ${JSON.stringify(txt.slice(0, 40))}`));
+
+  let r6a = await run('CASO 6a — RECURRENTE saluda (intent UNKNOWN)', histRecurring, [
+    ['hola', { intent: 'UNKNOWN' }],
+  ]);
+  let firstA = r6a.session.data.lastReply;
+  expect('Saludo empieza con "¡Hola de nuevo, Loann!"', firstA, firstA.startsWith('¡Hola de nuevo, Loann!'));
+
+  let r6b = await run('CASO 6b — RECURRENTE saluda, Groq lo lee como PREGUNTA_GENERAL (el bug)', histRecurring, [
+    ['hola buenas', { intent: 'PREGUNTA_GENERAL' }],
+  ]);
+  let firstB = r6b.session.data.lastReply;
+  expect('Saludo empieza con "¡Hola de nuevo, Loann!"', firstB, firstB.startsWith('¡Hola de nuevo, Loann!'));
+  expect('NO cae al fallback "✂️ Servicios:"', firstB, !firstB.startsWith('✂️ Servicios:'));
 })();

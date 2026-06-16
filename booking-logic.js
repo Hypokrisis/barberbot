@@ -513,18 +513,20 @@ async function respond({ session, msg, understood, ctx, deps }) {
     }
 
     // ── Sin cita activa ──────────────────────────────────────────────────────
-    // Pregunta general informativa (sin datos de cita) → responder y quedarse.
-    if (I === 'PREGUNTA_GENERAL' && !hasData) {
-      return await deps.askGeneral(msg);
-    }
-
-    // CASO B — recurrente sin cita activa (nombre conocido)
+    // CASO B — recurrente sin cita activa (nombre conocido). Se reconoce SIEMPRE
+    // primero, aunque Groq lea el saludo como PREGUNTA_GENERAL: el saludo de
+    // CASO B ya incluye los servicios con precios, así que también responde la
+    // pregunta informativa del cliente conocido.
     if (history && history.hasHistory) {
       if (hasData) { mergeUnderstood(); return await advanceCollecting(); }
       return out(recurringText(), 'collecting');
     }
 
     // CASO C — cliente nuevo
+    // Pregunta general informativa (sin datos de cita) → responder y quedarse.
+    if (I === 'PREGUNTA_GENERAL' && !hasData) {
+      return await deps.askGeneral(msg);
+    }
     if (hasData) { mergeUnderstood(); return await advanceCollecting(); }
     return out(welcomeText(), 'collecting');
   }
