@@ -29,9 +29,10 @@ const AVAILABLE = {
   b1: {
     [today]:    ['15:00', '16:30', '17:00', '18:00'],
     [tomorrow]: ['10:00', '11:00', '14:00', '18:00'],
-    [day3]:     ['10:30', '13:00'],
+    [day3]:     ['10:00', '13:00', '14:30'],
   },
-  b2: { [tomorrow]: ['10:00', '12:00'] },
+  // b2 (Pablo) NO trabaja hoy → su primer día disponible es mañana (para BUG 1/2).
+  b2: { [tomorrow]: ['10:00', '12:00', '13:00'] },
 };
 const toMin = (t) => { const [h, m] = t.split(':').map(Number); return h * 60 + m; };
 function genSlots(open, close) {
@@ -142,7 +143,8 @@ async function run(title, history, turns) {
   DB = [{ id: 'ap1', status: 'confirmed', customer_name: 'Carlos', appointment_date: tomorrow, start_time: '10:00', barber_id: 'b1', service_id: 's1' }];
   const histActive = { hasHistory: true, name: 'Carlos', activeAppointment: { appointment_date: tomorrow, start_time: '10:00', barber_id: 'b1', service_id: 's1' } };
   b = await run('C3 — CON CITA ACTIVA escribe "hola"', histActive, [['hola', { intent: 'UNKNOWN' }]]);
-  check('muestra la cita activa', b.session.data.lastReply.startsWith('¡Hola de nuevo, Carlos!'));
+  check('muestra la cita activa', b.session.data.lastReply.startsWith('¡Hola de nuevo, Carlos!') && b.session.data.lastReply.includes('Tienes una cita activa:'));
+  check('CASO A lista el menú (🔄 Reagendar)', b.session.data.lastReply.includes('🔄 Reagendar') && b.session.data.lastReply.includes('❓ Preguntar algo'));
 
   DB = [{ id: 'ap1', status: 'confirmed', customer_name: 'Carlos', appointment_date: tomorrow, start_time: '10:00', barber_id: 'b1', service_id: 's1' }];
   b = await run('C4 — CON CITA ACTIVA pide otra (regla #1)', histActive, [['quiero otro corte', { intent: 'NUEVA_CITA', service: 'Corte moderno' }]]);
@@ -162,6 +164,7 @@ async function run(title, history, turns) {
   const histRec = { hasHistory: true, name: 'Loann', activeAppointment: null };
   b = await run('C6 — RECURRENTE saluda leído como PREGUNTA_GENERAL', histRec, [['hola buenas', { intent: 'PREGUNTA_GENERAL' }]]);
   check('saluda "¡Hola de nuevo, Loann!"', b.session.data.lastReply.startsWith('¡Hola de nuevo, Loann!'));
+  check('CASO B lista el menú de capacidades', b.session.data.lastReply.includes('También puedo ayudarte a:'));
 
   // ── Transcript: horarios reales ────────────────────────────────────────────
   DB = [];
@@ -222,6 +225,7 @@ async function run(title, history, turns) {
   ]);
   check('empieza con "¡Bienvenido a Annlo Barber!"', b.session.data.lastReply.startsWith('¡Bienvenido a *Annlo Barber*!'));
   check('incluye las 4 líneas que debe pedir', /- Tu nombre[\s\S]*- El servicio[\s\S]*- El barbero[\s\S]*- El día y hora/.test(b.session.data.lastReply));
+  check('CASO C lista el menú de capacidades', b.session.data.lastReply.includes('También puedo ayudarte a:') && b.session.data.lastReply.includes('🔄 Reagendar tu cita'));
 
   DB = [];
   b = await run('C15 — Horarios en formato "tiene espacio / HOY — ..."', { hasHistory: false }, [
@@ -241,6 +245,37 @@ async function run(title, history, turns) {
     ['quiero reagendar', { intent: 'REAGENDAR' }],
   ]);
   check('pregunta "¿La cambiamos?"', b.session.data.lastReply.includes('¿La cambiamos?'));
+
+  // ── Bugs del transcript en vivo ────────────────────────────────────────────
+  // Pablo (b2) no trabaja hoy → su primer día disponible es mañana.
+  const histB2 = { hasHistory: true, name: 'Rita', activeAppointment: { appointment_date: tomorrow, start_time: '10:00', barber_id: 'b2', service_id: 's1' } };
+
+  DB = [{ id: 'ap2', status: 'confirmed', customer_name: 'Rita', appointment_date: tomorrow, start_time: '10:00', barber_id: 'b2', service_id: 's1' }];
+  b = await run('C18 — BUG1: reschedule "1pm" sin día → primer día disponible, no hoy', histB2, [
+    ['reagendar', { intent: 'REAGENDAR' }],            // ¿la cambiamos?
+    ['sí', { intent: 'CONFIRMAR' }],                   // → horarios (Pablo: mañana)
+    ['1pm', { intent: 'NUEVA_CITA', time: '13:00' }],  // hora SIN día
+  ]);
+  check('NO dice "ya pasó"', !b.session.data.lastReply.includes('ya pasó'));
+  check('confirma 1:00 PM en el primer día disponible', b.session.data.lastReply.includes('1:00 PM') && b.session.data.lastReply.includes('¿Confirmo?'));
+
+  DB = [{ id: 'ap2', status: 'confirmed', customer_name: 'Rita', appointment_date: tomorrow, start_time: '10:00', barber_id: 'b2', service_id: 's1' }];
+  b = await run('C19 — BUG2: "qué horarios tienes" en reschedule → mismo barbero, próximos días', histB2, [
+    ['reagendar', { intent: 'REAGENDAR' }],
+    ['sí', { intent: 'CONFIRMAR' }],
+    ['qué horarios tienes', { intent: 'PREGUNTA_GENERAL' }],
+  ]);
+  check('re-muestra horarios de Pablo (no pierde barbero)', b.session.data.lastReply.includes('Pablo') && b.session.data.lastReply.includes('tiene espacio:'));
+  check('NO salta a hoy / "ya pasó"', !b.session.data.lastReply.includes('ya pasó'));
+
+  DB = [];
+  b = await run('C20 — BUG3: "para el día 3 qué tienes" → lista numerada de ese día', { hasHistory: false }, [
+    ['soy Gus corte moderno con Pepe', { intent: 'NUEVA_CITA', name: 'Gus', service: 'Corte moderno', barber: 'Pepe' }],
+    ['para el día 3 qué tienes', { intent: 'NUEVA_CITA', date: day3 }],
+  ]);
+  check('lista numerada (1. / 2. / 3.)', /1\. .*\n2\. .*\n3\. /.test(b.session.data.lastReply));
+  check('pide "número o la hora"', b.session.data.lastReply.includes('responde el número o la hora'));
+  check('encabezado con barbero (Pepe)', b.session.data.lastReply.includes('Pepe'));
 
   console.log('\n══════════════════════════════════════════');
   console.log(FAILED === 0 ? '✅ TODOS LOS CHECKS PASARON' : `❌ ${FAILED} CHECK(S) FALLARON`);

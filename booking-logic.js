@@ -212,30 +212,35 @@ async function respond({ session, msg, understood, ctx, deps }) {
   }
 
   // ── Textos de bienvenida / saludo (CASO A / B / C) ──────────────────────────
+  // Menú de capacidades que cierra los saludos (CASO C y B).
+  function capabilitiesText() {
+    return `También puedo ayudarte a:\n📅 Agendar una cita\n🔄 Reagendar tu cita\n❌ Cancelar tu cita\n❓ Responder preguntas sobre *${ctx.business.name}*`;
+  }
   function welcomeText() {
     // CASO C — cliente nuevo
     return `¡Bienvenido a *${ctx.business.name}*! 💈\n` +
            `Para tu cita dime:\n- Tu nombre\n- El servicio que quieres\n- El barbero que prefieres\n- El día y hora aproximada\n\n` +
            `✂️ *Servicios:*\n${svcListText()}\n\n` +
            `💈 *Equipo:*\n${barberListText()}\n\n` +
+           `${capabilitiesText()}\n\n` +
            `📅 O reserva directo: ${linkOnce()}`;
   }
   function recurringText() {
     // CASO B — recurrente sin cita activa (nombre ya conocido → no se pide)
-    return `¡Hola de nuevo, ${history.name}! 👋\n¿Qué servicio buscas hoy?\n\n` +
+    return `¡Hola de nuevo, ${history.name}! 👋\n¿Qué necesitas hoy?\n\n` +
+           `${capabilitiesText()}\n\n` +
            `✂️ *Servicios:*\n${svcListText()}\n\n` +
            `💈 *Equipo:*\n${barberListText()}\n\n` +
-           `Dime el servicio y el barbero 😊\n` +
            `📅 O reserva: ${linkOnce()}`;
   }
   function activeApptText(a) {
     // CASO A — cliente con cita activa
     const sv = services.find(s => s.id === a.service_id);
     const ba = barbers.find(b => b.id === a.barber_id);
-    return `¡Hola de nuevo, ${history.name}! 👋\nYa tienes una cita activa:\n` +
+    return `¡Hola de nuevo, ${history.name}! 👋\nTienes una cita activa:\n` +
            `✂️ ${sv ? sv.name : 'tu servicio'} con ${ba ? ba.name : 'tu barbero'}\n` +
            `📅 ${formatDate(a.appointment_date)} a las ${formatTime(a.start_time)}\n\n` +
-           `¿Qué necesitas?\n(reagendar / cancelar / preguntar algo)`;
+           `¿Qué necesitas?\n🔄 Reagendar\n❌ Cancelar\n📅 Nueva cita\n❓ Preguntar algo`;
   }
 
   // Construye y muestra disponibilidad. Mueve a picking_slot / rescheduling.
@@ -339,9 +344,18 @@ async function respond({ session, msg, understood, ctx, deps }) {
     const bk = d.bk;
     const offered = d.offered || [];
 
+    // Día por defecto para "hora sin día": el PRIMER día disponible mostrado; si
+    // no hay lista, el primer día próximo con cupo. NUNCA "hoy" a ciegas (BUG 1:
+    // "1pm" durante reagendar caía en hoy → "esa hora ya pasó").
+    async function defaultDate() {
+      if (offered[0] && offered[0].date) return offered[0].date;
+      const up = await deps.getUpcoming(bk.barberId, 1, 1);
+      return (up[0] && up[0].date) || todayPR();
+    }
+
     // 0. AM/PM ambiguo → preguntar una vez (sin asumir).
     if (understood.time && understood.ampm_ambiguous) {
-      const date = resolveDateToken(understood.date) || (offered[0] && offered[0].date) || todayPR();
+      const date = resolveDateToken(understood.date) || await defaultDate();
       return ampmAsk(date, forReschedule);
     }
     // 1. Elección por posición ("1", "el primero") — re-verifica vs DB (Punto 4).
@@ -349,13 +363,13 @@ async function respond({ session, msg, understood, ctx, deps }) {
       const sel = offered[choiceNum - 1];
       return await confirmSlot(sel.date, sel.time, forReschedule);
     }
-    // 2. Hora explícita → SIEMPRE se verifica contra la DB (Punto 2 y 4).
+    // 2. Hora explícita → verificar vs DB. Sin día → primer día disponible (BUG 1).
     if (understood.time) {
       const t = normalizeTime(understood.time);
-      const targetDate = resolveDateToken(understood.date) || (offered[0] && offered[0].date) || todayPR();
+      const targetDate = resolveDateToken(understood.date) || await defaultDate();
       return await confirmSlot(targetDate, t, forReschedule);
     }
-    // 3. Solo fecha (sin hora) → mostrar ese día (cupos reales).
+    // 3. Día específico → lista NUMERADA con TODOS los cupos de ese día (BUG 3).
     if (understood.date) {
       const targetDate = resolveDateToken(understood.date);
       if (targetDate && daysFromToday(targetDate) > 30) {
@@ -363,16 +377,21 @@ async function respond({ session, msg, understood, ctx, deps }) {
       }
       const day = targetDate ? await deps.getDayAvailability(bk.barberId, targetDate) : null;
       if (day && !day.closed && day.available.length) {
-        const pick = spreadSlots(day.available, 4);
-        d.offered = pick.map(x => ({ date: targetDate, time: x }));
-        return out(`📅 *${displayDay(targetDate)}*:\n- ${pick.map(formatTime).join(' • ')}\n\n¿Cuál te queda bien?`);
+        d.offered = day.available.map(t => ({ date: targetDate, time: t }));
+        const lines = day.available.map((t, i) => `${i + 1}. ${formatTime(t)}`).join('\n');
+        return out(
+          `📅 *${bk.barberName}* el ${formatDate(targetDate).toLowerCase()}:\n${lines}\n\n` +
+          `¿Cuál prefieres? (responde el número o la hora)`,
+          forReschedule ? 'rescheduling' : 'picking_slot'
+        );
       }
       d.negotiation = (d.negotiation || 0) + 1;
       if (d.negotiation > 2) { resetData(); return out(`Mejor elige en el calendario: ${linkOnce()}`, 'idle'); }
       return await offerSlots(forReschedule, day && day.closed ? `Ese día ${bk.barberName} no abre 😕` : null);
     }
-    // 4. No entendido → re-preguntar (dedupe garantiza que no repita literal)
-    return out(`¿Cuál de esos horarios te queda bien? También puedes decirme una hora y te verifico 🙂`);
+    // 4. Sin hora/día/elección (ej "qué horarios tienes") → RE-MOSTRAR los próximos
+    //    días del MISMO barbero, sin perder contexto ni saltar a hoy (BUG 2).
+    return await offerSlots(forReschedule);
   }
 
   // Pide lo que falte (nombre/servicio/barbero) o pasa a ofrecer horarios.
