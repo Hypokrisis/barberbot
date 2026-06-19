@@ -138,6 +138,15 @@ function canSendReports(business) {
   return plan === 'pro' || plan === 'premium';
 }
 
+// Link de reservas del negocio (multi-tenant). Prioriza el link propio; si no,
+// /book/<slug>; si tampoco hay slug, cae al sitio genérico de la plataforma.
+// NUNCA debe apuntar a un negocio específico por defecto.
+function bookingLinkFor(business) {
+  if (business && business.whatsapp_booking_link) return business.whatsapp_booking_link;
+  if (business && business.slug) return `https://spaceyreserve.netlify.app/book/${business.slug}`;
+  return 'https://spaceyreserve.netlify.app';
+}
+
 function canSendProactive(business) {
   return getPlan(business) === 'premium';
 }
@@ -665,7 +674,7 @@ async function sendProactiveReengagement() {
 
         if (recent && recent.length > 0) continue;
 
-        const bookingLink = business.whatsapp_booking_link || `https://spaceyreserve.netlify.app/book/${business.slug}`;
+        const bookingLink = bookingLinkFor(business);
         const customOffer = business.whatsapp_offer ? `\n\n${business.whatsapp_offer}` : '';
         const msg = `¡Hola ${client.customer_name}! Hace tiempo no te vemos en ${business.name} 💈${customOffer}\nEsta semana tenemos disponibilidad. ¿Quieres reservar?\n🔗 ${bookingLink}`;
 
@@ -825,7 +834,7 @@ function getOutOfHoursReply(business) {
   const prNow = new Date(Date.now() - 4 * 3600 * 1000); // Puerto Rico = UTC-4 (sin DST)
   const cur = prNow.getUTCHours() * 60 + prNow.getUTCMinutes();
   if (cur >= start && cur < end) return null; // dentro de horario
-  const link = business.whatsapp_booking_link || `https://spaceyreserve.netlify.app/book/${business.slug || ''}`;
+  const link = bookingLinkFor(business);
   return `Gracias por escribir a *${business.name}* 🌙\n\nNuestro horario de atención es de ${business.whatsapp_bot_start_hour} a ${business.whatsapp_bot_end_hour}. Te responderemos en cuanto volvamos a abrir.\n\n¿Quieres reservar en línea? 👉 ${link}`;
 }
 
@@ -849,7 +858,7 @@ async function handleMessage(phone, message, businessId) {
   const session = await getSession(phone);
   const { business, barbers, services } = await getBusinessInfo(businessId);
   const msg = message.trim();
-  const bookingLink = business.whatsapp_booking_link || `https://spaceyreserve.netlify.app/book/${business.slug || 'annlobarberia'}`;
+  const bookingLink = bookingLinkFor(business);
 
   // Fuera de horario: si el dueño activó el horario automático, responder y no procesar
   const offHours = getOutOfHoursReply(business);
@@ -1064,7 +1073,7 @@ app.post('/webhook', validateTwilioSignature, async (req, res) => {
   }
 });
 
-app.get('/health', (_, res) => res.json({ status: 'ok', version: '4.4.0-flow-fixes-ux' }));
+app.get('/health', (_, res) => res.json({ status: 'ok', version: '4.4.1-booking-link-tenant-safe' }));
 
 app.post('/admin/report', async (req, res) => {
   const { type = 'bihourly' } = req.body;
