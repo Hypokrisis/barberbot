@@ -1064,7 +1064,7 @@ app.post('/webhook', validateTwilioSignature, async (req, res) => {
   }
 });
 
-app.get('/health', (_, res) => res.json({ status: 'ok', version: '4.3.2-greeting-caseA' }));
+app.get('/health', (_, res) => res.json({ status: 'ok', version: '4.4.0-flow-fixes-ux' }));
 
 app.post('/admin/report', async (req, res) => {
   const { type = 'bihourly' } = req.body;

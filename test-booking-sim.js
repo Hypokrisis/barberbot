@@ -300,6 +300,100 @@ async function run(title, history, turns) {
   check('pide "número o la hora"', b.session.data.lastReply.includes('responde el número o la hora'));
   check('encabezado con barbero (Pepe)', b.session.data.lastReply.includes('Pepe'));
 
+  // ════════════════════════════════════════════════════════════════════════════
+  // BUGS DE LA PRUEBA REAL (5) + MEJORA DE UX (recordatorio fijo de opciones)
+  // ════════════════════════════════════════════════════════════════════════════
+
+  // BUG 1 — "tengo preguntas" en CASO B → invita y espera (no pide servicio/barbero).
+  console.log('\n══════════════════════════════════════════\nC21 — BUG1: "tengo preguntas" → invita y espera\n══════════════════════════════════════════');
+  {
+    const bot = makeBot(histRec); // CASO B (recurrente, sin cita)
+    let r;
+    r = await bot.send('hola', { intent: 'PREGUNTA_GENERAL' });        console.log('👤 hola\n🤖', r, '\n');
+    r = await bot.send('tengo preguntas', { intent: 'PREGUNTA_GENERAL' }); console.log('👤 tengo preguntas\n🤖', r, '\n');
+    check('invita "dime qué quieres saber"', r.includes('dime qué quieres saber'));
+    check('NO empuja datos ("Me falta")', !r.includes('Me falta'));
+    r = await bot.send('cuánto cuesta el corte', { intent: 'PREGUNTA_GENERAL' }); console.log('👤 cuánto cuesta el corte\n🤖', r, '\n');
+    check('responde la pregunta de seguimiento', r.toLowerCase().includes('cuesta'));
+  }
+
+  // BUG 2 — nombre parcial de barbero: "pache" → Pacheco (startsWith).
+  console.log('\n══════════════════════════════════════════\nC22 — BUG2: "pache" coincide con Pacheco\n══════════════════════════════════════════');
+  {
+    const bp = [{ id: 'b1', name: 'Pacheco' }, { id: 'b2', name: 'Luis' }];
+    console.log('matchBarber("pache") →', (bl.matchBarber('pache', bp) || {}).name);
+    check('"pache" → Pacheco', (bl.matchBarber('pache', bp) || {}).name === 'Pacheco');
+    check('"pach" → Pacheco', (bl.matchBarber('pach', bp) || {}).name === 'Pacheco');
+    check('"luis" sigue funcionando', (bl.matchBarber('luis', bp) || {}).name === 'Luis');
+  }
+
+  // BUG 3 — fecha inexistente "32 de junio" (2026-06-32) → la rechaza.
+  DB = [];
+  b = await run('C23 — BUG3: "32 de junio" (fecha inexistente) → la rechaza', { hasHistory: false }, [
+    ['soy Ivo corte moderno con Pepe', { intent: 'NUEVA_CITA', name: 'Ivo', service: 'Corte moderno', barber: 'Pepe' }],
+    ['el 32 de junio', { intent: 'NUEVA_CITA', date: '2026-06-32' }],
+  ]);
+  check('responde "Esa fecha no existe"', b.session.data.lastReply.includes('Esa fecha no existe'));
+  check('NO confirma ninguna cita', !b.session.data.lastReply.includes('¿Confirmo?'));
+  check('isInvalidDateToken(2026-06-32)=true, (2026-06-30)=false', bl.isInvalidDateToken('2026-06-32') === true && bl.isInvalidDateToken('2026-06-30') === false);
+
+  // BUG 4 — "quiero otra hora" creando una cita NUEVA no se va a REAGENDAR.
+  DB = [];
+  console.log('\n══════════════════════════════════════════\nC24 — BUG4: "quiero otra hora" creando cita NUEVA no bota al cliente\n══════════════════════════════════════════');
+  {
+    const bot = makeBot({ hasHistory: false });
+    let r;
+    r = await bot.send('soy Noa corte moderno con Pepe', { intent: 'NUEVA_CITA', name: 'Noa', service: 'Corte moderno', barber: 'Pepe' });
+    console.log('👤 soy Noa corte moderno con Pepe\n🤖', r, '\n');
+    r = await bot.send('no', { intent: 'NEGAR' });            console.log('👤 no\n🤖', r, '\n');
+    r = await bot.send('quiero otra hora', { intent: 'REAGENDAR' }); console.log('👤 quiero otra hora\n🤖', r, '\n');
+    check('NO dice "No tienes citas activas"', !r.includes('No tienes citas activas'));
+    check('sigue en el flujo de creación (picking_slot)', bot.session.state === 'picking_slot');
+  }
+
+  // BUG 5 — pregunta con palabra de tiempo en CASO A → responde, no bloquea.
+  DB = [{ id: 'ap1', status: 'confirmed', customer_name: 'Carlos', appointment_date: tomorrow, start_time: '10:00', barber_id: 'b1', service_id: 's1' }];
+  b = await run('C25 — BUG5: cita activa + "¿hasta qué hora abren los sábados?" → responde', histActive, [
+    ['hasta qué hora abren los sábados?', { intent: 'PREGUNTA_GENERAL', date: 'saturday', time: '18:00' }],
+  ]);
+  check('NO bloquea con "una cita activa"', !b.session.data.lastReply.includes('una cita activa'));
+  check('responde la pregunta (askGeneral)', b.session.data.lastReply.toLowerCase().includes('cuesta'));
+
+  // UX — recordatorio fijo: presente en "Me falta X"; ausente en bienvenida y
+  // confirmación final. (Se asierta sobre el TEXTO ENVIADO, no sobre lastReply,
+  // que guarda solo el cuerpo sin el recordatorio para el anti-repetición.)
+  const REM = 'Cualquier momento puedes decir';
+
+  DB = [];
+  console.log('\n══════════════════════════════════════════\nC26 — UX: "Me falta X" incluye el recordatorio fijo\n══════════════════════════════════════════');
+  {
+    const bot = makeBot({ hasHistory: false });
+    const r = await bot.send('soy Ana corte moderno', { intent: 'NUEVA_CITA', name: 'Ana', service: 'Corte moderno' });
+    console.log('👤 soy Ana corte moderno\n🤖', r, '\n');
+    check('mensaje pide lo que falta (barbero)', r.includes('Me falta') || r.includes('barbero'));
+    check('INCLUYE el recordatorio fijo', r.includes(REM));
+  }
+
+  DB = [];
+  console.log('\n══════════════════════════════════════════\nC27 — UX: bienvenida NO lleva recordatorio (ya tiene menú)\n══════════════════════════════════════════');
+  {
+    const bot = makeBot({ hasHistory: false });
+    const r = await bot.send('hola', { intent: 'UNKNOWN' });
+    console.log('👤 hola\n🤖', r, '\n');
+    check('bienvenida (CASO C) NO incluye recordatorio', !r.includes(REM));
+  }
+
+  DB = [];
+  console.log('\n══════════════════════════════════════════\nC27b — UX: confirmación final "✅ ¡Listo!" NO lleva recordatorio\n══════════════════════════════════════════');
+  {
+    const bot = makeBot({ hasHistory: false });
+    await bot.send('soy Eva corte moderno con Pepe mañana a las 10', { intent: 'NUEVA_CITA', name: 'Eva', service: 'Corte moderno', barber: 'Pepe', date: 'tomorrow', time: '10:00' });
+    const r = await bot.send('sí', { intent: 'CONFIRMAR' });
+    console.log('👤 sí\n🤖', r, '\n');
+    check('confirmación final empieza con "✅ ¡Listo"', r.startsWith('✅ ¡Listo'));
+    check('confirmación final NO incluye recordatorio', !r.includes(REM));
+  }
+
   console.log('\n══════════════════════════════════════════');
   console.log(FAILED === 0 ? '✅ TODOS LOS CHECKS PASARON' : `❌ ${FAILED} CHECK(S) FALLARON`);
   process.exit(FAILED === 0 ? 0 : 1);

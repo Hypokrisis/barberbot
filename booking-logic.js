@@ -60,11 +60,26 @@ const WEEKDAYS = {
   'jueves': 4, 'viernes': 5, 'sábado': 6, 'sabado': 6,
 };
 
+// ¿La terna y-m-d corresponde a una fecha real del calendario? (sin rollover)
+function isRealDate(y, m, d) {
+  if (!(m >= 1 && m <= 12 && d >= 1 && d <= 31)) return false;
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
+// Token YYYY-MM-DD con día/mes que NO existen (ej "2026-06-32" = "32 de junio").
+function isInvalidDateToken(token) {
+  if (!token) return false;
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(token).trim());
+  return m ? !isRealDate(+m[1], +m[2], +m[3]) : false;
+}
+
 // "today" | "tomorrow" | día-semana-es | YYYY-MM-DD → YYYY-MM-DD (o null)
 function resolveDateToken(token) {
   if (!token) return null;
   const t = String(token).trim().toLowerCase();
-  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t;
+  // YYYY-MM-DD: solo si es una fecha real (no "2026-06-32", que JS rodaría a julio).
+  const ymd = /^(\d{4})-(\d{2})-(\d{2})$/.exec(t);
+  if (ymd) return isRealDate(+ymd[1], +ymd[2], +ymd[3]) ? t : null;
   const todayStr = todayPR();
   const base = new Date(todayStr + 'T12:00:00');
   if (t === 'today' || t === 'hoy') return todayStr;
@@ -117,7 +132,11 @@ function matchBarber(name, barbers) {
   if (!name) return null;
   const n = String(name).toLowerCase().trim();
   return barbers.find(b => b.name.toLowerCase() === n)
-      || barbers.find(b => b.name.toLowerCase().includes(n) || n.includes(b.name.toLowerCase()))
+      // Prefijo: "pache" → "Pacheco". Más preciso que includes y prioritario.
+      || barbers.find(b => { const bn = b.name.toLowerCase(); return bn.startsWith(n) || n.startsWith(bn); })
+      || barbers.find(b => { const bn = b.name.toLowerCase(); return bn.includes(n) || n.includes(bn); })
+      // Coincidencia por nombre de pila (cualquier palabra del nombre empieza con n).
+      || barbers.find(b => b.name.toLowerCase().split(/\s+/).some(w => w.startsWith(n)))
       || null;
 }
 
@@ -155,6 +174,17 @@ function isGreeting(t) {
   const s = String(t || '').trim().toLowerCase().replace(/[\s!.,¡?¿…]+$/u, '');
   return /^(hola+|ola|buenas|buenos d[ií]as|buen d[ií]a|buenas tardes|buenas noches|hey+|ey+|hi|hello|holi+|saludos|qu[eé] tal|qu[eé] lo que|klk|wepa+|qu[eé] m[aá]s)$/u.test(s);
 }
+// Frase-meta "tengo preguntas/dudas" SIN una pregunta concreta todavía. Sirve
+// para invitar a preguntar y ESPERAR, en vez de empujar el flujo de datos.
+function wantsToAsk(t) {
+  const s = String(t || '').trim().toLowerCase();
+  if (/[?¿]/.test(s)) return false; // ya trae una pregunta real
+  return /\b(tengo|teng|tngo|hacer|puedo|quiero|kiero|podr[ií]a|ten[ií]a|hay|es)\b[^?]*\b(pregunta|preguntas|duda|dudas|preguntar|consulta|consultas|consultar)\b/u.test(s)
+      || /^(pregunta|preguntas|duda|dudas|consulta|consultas)$/u.test(s);
+}
+// Recordatorio fijo de opciones (UX). SIEMPRE idéntico para que el cliente lo
+// reconozca; el resto del mensaje puede variar para evitar repetición literal.
+const OPTIONS_REMINDER = '💬 Cualquier momento puedes decir: *cita* · *reagendar* · *cancelar* · o preguntar algo';
 
 // ════════════════════════════════════════════════════════════════════════════
 // MOTOR PRINCIPAL
@@ -187,11 +217,19 @@ async function respond({ session, msg, understood, ctx, deps }) {
     for (const [a, b] of swaps) if (t.includes(a)) return t.split(a).join(b);
     return 'Como te decía 🙂 ' + t;
   }
-  function out(text, state) {
+  // out(text, state, opts) — opts.reminder=false omite el recordatorio de opciones.
+  // El recordatorio se omite SIEMPRE en mensajes finales (✅) y en prompts de sí/no,
+  // y se OPTA por omitir en bienvenidas/confirmaciones cortas. El anti-repetición
+  // (REGLA #3) opera sobre el CUERPO (sin el recordatorio fijo), por eso lastReply
+  // guarda el cuerpo y el recordatorio se pega al final después.
+  function out(text, state, opts) {
     if (state !== undefined) session.state = state;
     if (text === d.lastReply) text = reword(text);     // REGLA #3: nunca repetir literal
     d.lastReply = text;
-    return text;
+    const isFinal = /^✅/.test(text);
+    const isYesNo = /\(sí\/no\)|\*sí\* o \*no\*/.test(text);
+    const omit = (opts && opts.reminder === false) || isFinal || isYesNo;
+    return omit ? text : `${text}\n\n${OPTIONS_REMINDER}`;
   }
   // El link aparece máximo 2 veces por conversación (REGLA #7)
   function linkOnce() {
@@ -304,7 +342,7 @@ async function respond({ session, msg, understood, ctx, deps }) {
     d.offered = [{ date, time: amT }, { date, time: pmT }];
     d.negotiation = 0;
     return out(`¿Te refieres a las ${formatTime(amT)} o las ${formatTime(pmT)}? 🙂`,
-      forReschedule ? 'rescheduling' : 'picking_slot');
+      forReschedule ? 'rescheduling' : 'picking_slot', { reminder: false });
   }
 
   // CHOKEPOINT (Punto 4): toda hora puntual se verifica contra la DB aquí antes
@@ -476,7 +514,7 @@ async function respond({ session, msg, understood, ctx, deps }) {
       `⚠️ ¿Seguro que quieres cancelar?\n` +
       `✂️ ${sv ? sv.name : 'Servicio'} · 💈 ${ba ? ba.name : 'Barbero'}\n` +
       `📅 ${formatDate(a.appointment_date)} a las ${formatTime(a.start_time)}`,
-      'confirming'
+      'confirming', { reminder: false }
     );
   }
 
@@ -548,15 +586,36 @@ async function respond({ session, msg, understood, ctx, deps }) {
     return out(`¿Confirmo la cita? Responde *sí* o *no*.`);
   }
 
-  // 2) INTENTS GLOBALES sobre la cita existente — prioridad sobre el estado.
-  if (I === 'REAGENDAR') return await startReschedule();
-  if (I === 'CANCELAR')  return await startCancel();
-  if (I === 'VER_CITA')  return await showAppointment();
+  // ── Guardas previas al ruteo por estado (confirming ya retornó arriba) ───────
+  const hasData = !!(understood.service || understood.name || understood.barber || understood.time || understood.date);
+
+  // BUG 3 — Fecha inexistente (ej "32 de junio" → 2026-06-32, que JS rodaría a
+  // julio en silencio). No la aceptamos; pedimos de nuevo sin perder el estado.
+  if (isInvalidDateToken(understood.date)) {
+    return out(`Esa fecha no existe 😅 ¿qué día quieres decir?`);
+  }
+
+  // BUG 1 — "tengo preguntas/dudas" sin una pregunta concreta todavía → invitar
+  // a preguntar y ESPERAR, en vez de empujar el flujo de datos (servicio/barbero).
+  if (wantsToAsk(msg) && !hasData) {
+    return out(`Claro, dime qué quieres saber 😊`);
+  }
+
+  // 2) INTENTS GLOBALES (reagendar/cancelar/ver cita EXISTENTE) — prioridad sobre
+  //    el estado. EXCEPCIÓN BUG 4: si el cliente está creando una cita NUEVA
+  //    (collecting/picking_slot), un "quiero otra hora" que Groq lee como
+  //    REAGENDAR NO debe botarlo con "no tienes citas activas"; debe caer al flujo
+  //    actual (pickSlot/collecting) y re-elegir horario sin perder el contexto.
+  const inCreateFlow = session.state === 'collecting' || session.state === 'picking_slot';
+  if (!inCreateFlow) {
+    if (I === 'REAGENDAR') return await startReschedule();
+    if (I === 'CANCELAR')  return await startCancel();
+    if (I === 'VER_CITA')  return await showAppointment();
+  }
 
   // 3) IDLE — aquí aplica el PASO 0 (CASO A / B / C)
   if (session.state === 'idle') {
     const active = history && history.activeAppointment;
-    const hasData = !!(understood.service || understood.name || understood.barber || understood.time || understood.date);
 
     // Filtro de relevancia: en reposo, un mensaje claramente ajeno a la barbería
     // se corta UNA vez. (En flujos activos no se llega aquí; allí un mensaje corto
@@ -571,19 +630,20 @@ async function respond({ session, msg, understood, ctx, deps }) {
       if (I === 'CONFIRMAR') {
         return out(`✅ ¡Perfecto! Te esperamos a las ${formatTime(active.start_time)} 💈`);
       }
-      // REGLA #1: pide nueva cita o manda datos de reserva → no se crea otra.
-      if (I === 'NUEVA_CITA' || hasData) {
-        return out(`Solo puedes tener una cita activa a la vez 😊 ¿Quieres *cambiar* la que tienes o *cancelarla* primero?`);
-      }
-      // Pregunta general REAL → responder y retomar opciones. Un saludo pelado
-      // NO es pregunta: cae al mensaje limpio de la cita (evita mezclar el
-      // welcome de askGeneral con el footer de CASO A).
+      // BUG 5 — Pregunta general REAL va PRIMERO, ANTES que hasData: aunque Groq
+      // extrajo por error un día/hora de "¿hasta qué hora abren los sábados?", si
+      // la intención es PREGUNTA_GENERAL SIEMPRE se responde (nunca el bloqueo de
+      // "una cita activa"). Un saludo pelado no es pregunta → cae al mensaje limpio.
       if (I === 'PREGUNTA_GENERAL' && !isGreeting(msg)) {
         const ans = await deps.askGeneral(msg);
         return out(`${ans}\n\n¿Algo más con tu cita? (reagendar / cancelar)`);
       }
-      // Saludo / cualquier otra cosa → mostrar la cita y las opciones.
-      return out(activeApptText(active));
+      // REGLA #1: pide nueva cita o manda datos de reserva → no se crea otra.
+      if (I === 'NUEVA_CITA' || hasData) {
+        return out(`Solo puedes tener una cita activa a la vez 😊 ¿Quieres *cambiar* la que tienes o *cancelarla* primero?`);
+      }
+      // Saludo / cualquier otra cosa → mostrar la cita y las opciones (ya trae menú).
+      return out(activeApptText(active), undefined, { reminder: false });
     }
 
     // ── Sin cita activa ──────────────────────────────────────────────────────
@@ -593,7 +653,7 @@ async function respond({ session, msg, understood, ctx, deps }) {
     // pregunta informativa del cliente conocido.
     if (history && history.hasHistory) {
       if (hasData) { mergeUnderstood(); return await advanceCollecting(); }
-      return out(recurringText(), 'collecting');
+      return out(recurringText(), 'collecting', { reminder: false });
     }
 
     // CASO C — cliente nuevo
@@ -604,11 +664,17 @@ async function respond({ session, msg, understood, ctx, deps }) {
       return out(`${ans}\n\n¿Puedo ayudarte con algo más? 🙂`);
     }
     if (hasData) { mergeUnderstood(); return await advanceCollecting(); }
-    return out(welcomeText(), 'collecting');
+    return out(welcomeText(), 'collecting', { reminder: false });
   }
 
   // 4) COLLECTING
   if (session.state === 'collecting') {
+    // Pregunta informativa a mitad de la recolección → responder sin perder lo
+    // ya recolectado, y retomar (complemento de BUG 1: tras "tengo preguntas").
+    if (I === 'PREGUNTA_GENERAL' && !hasData && !isGreeting(msg)) {
+      const ans = await deps.askGeneral(msg);
+      return out(`${ans}\n\n¿Seguimos con tu cita? 🙂`);
+    }
     mergeUnderstood();
     return await advanceCollecting();
   }
@@ -633,4 +699,5 @@ module.exports = {
   // helpers expuestos para tests / index.js
   todayPR, formatDate, formatTime, shortDate, displayDay, resolveDateToken, normalizeTime,
   addDuration, matchService, matchBarber, spreadSlots, nearestSlots, joinNatural, titleCase,
+  isGreeting, wantsToAsk, isInvalidDateToken, isRealDate,
 };
