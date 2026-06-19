@@ -933,9 +933,12 @@ async function handleMessage(phone, message, businessId) {
         await suppressBotTemplate(apptId, 'cancelled');
         return { ok: true };
       },
+      // Fallback sin Groq: respuesta informativa neutral (lista de servicios).
+      // SIN CTA de reserva — el motor (CASO A/C) añade su propio cierre, así que
+      // no debe pedir "dime tu nombre para agendar" a quien ya tiene cita.
       askGeneral: (m) => canUseGroq(business)
         ? askGroq(session, m, business, services)
-        : Promise.resolve(`¡Bienvenido! 💈 Soy el asistente de ${business.name}.\n\n✂️ Servicios:\n${services.map(s => `• ${s.name} — $${s.price}`).join('\n')}\n\nDime tu nombre, el servicio y el barbero para agendar 🙂`),
+        : Promise.resolve(`Soy el asistente de ${business.name} 💈\n\n✂️ *Servicios:*\n${services.map(s => `• ${s.name} — $${s.price}`).join('\n')}`),
     },
   });
 }
@@ -1061,7 +1064,7 @@ app.post('/webhook', validateTwilioSignature, async (req, res) => {
   }
 });
 
-app.get('/health', (_, res) => res.json({ status: 'ok', version: '4.3.1-no-repeat-slots' }));
+app.get('/health', (_, res) => res.json({ status: 'ok', version: '4.3.2-greeting-caseA' }));
 
 app.post('/admin/report', async (req, res) => {
   const { type = 'bihourly' } = req.body;

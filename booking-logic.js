@@ -147,6 +147,14 @@ function joinNatural(arr, conj = 'y') {
 function titleCase(s) {
   return String(s).trim().split(/\s+/).map(w => w ? w[0].toUpperCase() + w.slice(1) : w).join(' ').slice(0, 40);
 }
+// Saludo "pelado": el mensaje es SOLO un saludo, sin pregunta ni datos. Se usa
+// para que un "hola" muestre el mensaje propio de cada caso (CASO A → su cita;
+// CASO C → la bienvenida) en vez de enrutarse a askGeneral, que en planes sin
+// Groq devuelve un welcome de reserva y mezclaba textos de dos casos distintos.
+function isGreeting(t) {
+  const s = String(t || '').trim().toLowerCase().replace(/[\s!.,¡?¿…]+$/u, '');
+  return /^(hola+|ola|buenas|buenos d[ií]as|buen d[ií]a|buenas tardes|buenas noches|hey+|ey+|hi|hello|holi+|saludos|qu[eé] tal|qu[eé] lo que|klk|wepa+|qu[eé] m[aá]s)$/u.test(s);
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // MOTOR PRINCIPAL
@@ -567,8 +575,10 @@ async function respond({ session, msg, understood, ctx, deps }) {
       if (I === 'NUEVA_CITA' || hasData) {
         return out(`Solo puedes tener una cita activa a la vez 😊 ¿Quieres *cambiar* la que tienes o *cancelarla* primero?`);
       }
-      // Pregunta general → responder y retomar opciones.
-      if (I === 'PREGUNTA_GENERAL') {
+      // Pregunta general REAL → responder y retomar opciones. Un saludo pelado
+      // NO es pregunta: cae al mensaje limpio de la cita (evita mezclar el
+      // welcome de askGeneral con el footer de CASO A).
+      if (I === 'PREGUNTA_GENERAL' && !isGreeting(msg)) {
         const ans = await deps.askGeneral(msg);
         return out(`${ans}\n\n¿Algo más con tu cita? (reagendar / cancelar)`);
       }
@@ -587,8 +597,9 @@ async function respond({ session, msg, understood, ctx, deps }) {
     }
 
     // CASO C — cliente nuevo
-    // Pregunta general informativa (sin datos de cita) → responder y retomar.
-    if (I === 'PREGUNTA_GENERAL' && !hasData) {
+    // Pregunta general informativa REAL (sin datos de cita) → responder y
+    // retomar. Un saludo pelado cae a la bienvenida completa de abajo.
+    if (I === 'PREGUNTA_GENERAL' && !hasData && !isGreeting(msg)) {
       const ans = await deps.askGeneral(msg);
       return out(`${ans}\n\n¿Puedo ayudarte con algo más? 🙂`);
     }

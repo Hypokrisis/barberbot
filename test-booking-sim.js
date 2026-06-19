@@ -246,6 +246,17 @@ async function run(title, history, turns) {
   ]);
   check('pregunta "¿La cambiamos?"', b.session.data.lastReply.includes('¿La cambiamos?'));
 
+  // BUG del transcript: cita activa + "hola" que Groq lee como PREGUNTA_GENERAL.
+  // Antes enrutaba a askGeneral (welcome de reserva) y lo pegaba al footer de
+  // CASO A → un solo mensaje mezclando "dime tu nombre" (CASO C) + "¿Algo más
+  // con tu cita?" (CASO A). Ahora un saludo muestra SOLO la cita (CASO A limpio).
+  DB = [{ id: 'ap1', status: 'confirmed', customer_name: 'Carlos', appointment_date: tomorrow, start_time: '10:00', barber_id: 'b1', service_id: 's1' }];
+  b = await run('C17b — BUG: cita activa + "hola" leído como PREGUNTA_GENERAL → CASO A limpio', histActive, [
+    ['hola', { intent: 'PREGUNTA_GENERAL' }],
+  ]);
+  check('muestra la cita activa (CASO A)', b.session.data.lastReply.includes('Tienes una cita activa:'));
+  check('NO enruta a askGeneral ni mezcla welcome', !/dime tu nombre/i.test(b.session.data.lastReply) && !b.session.data.lastReply.includes('Corte moderno cuesta'));
+
   // ── Bugs del transcript en vivo ────────────────────────────────────────────
   // Pablo (b2) no trabaja hoy → su primer día disponible es mañana.
   const histB2 = { hasHistory: true, name: 'Rita', activeAppointment: { appointment_date: tomorrow, start_time: '10:00', barber_id: 'b2', service_id: 's1' } };
