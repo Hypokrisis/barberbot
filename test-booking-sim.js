@@ -394,6 +394,72 @@ async function run(title, history, turns) {
     check('confirmación final NO incluye recordatorio', !r.includes(REM));
   }
 
+  // ════════════════════════════════════════════════════════════════════════════
+  // BUGS DE LA PRUEBA REAL #2 (CSV Twilio 2026-06-19) — reagendar: pidió LUNES y
+  // se quedaba en SÁBADO. Tres fixes: día con día+hora, corrección en confirming,
+  // y hora suelta que no reinicia. (Groq mockeado YA devuelve la fecha YYYY-MM-DD
+  // absoluta, que es lo que el FIX del prompt garantiza en producción.)
+  // ════════════════════════════════════════════════════════════════════════════
+
+  // C28 — FIX1: "para el lunes a la 1pm" reagendando → confirma DAY3, NO el 1er día.
+  DB = [{ id: 'ap1', status: 'confirmed', customer_name: 'Carlos', appointment_date: tomorrow, start_time: '10:00', barber_id: 'b1', service_id: 's1' }];
+  b = await run('C28 — FIX1: día+hora reagendando confirma el DÍA pedido (no el primero)', histActive, [
+    ['reagendar', { intent: 'REAGENDAR' }],
+    ['sí', { intent: 'CONFIRMAR' }],
+    ['lo quiero para el lunes a la 1pm', { intent: 'REAGENDAR', date: day3, time: '13:00' }],
+  ]);
+  check('confirma en el día pedido (day3) a la 1:00 PM', b.session.data.lastReply.includes(bl.formatDate(day3)) && b.session.data.lastReply.includes('1:00 PM') && b.session.data.lastReply.includes('¿Confirmo?'));
+  check('NO cayó en hoy (el bug original lo mandaba al 1er día)', !b.session.data.lastReply.includes(bl.formatDate(today)));
+
+  // C29 — FIX1B: hora SIN día y varios días con cupo → pregunta "¿para qué día?",
+  // nunca asume; al responder el día, confirma esa hora en ese día.
+  DB = [{ id: 'ap1', status: 'confirmed', customer_name: 'Carlos', appointment_date: tomorrow, start_time: '10:00', barber_id: 'b1', service_id: 's1' }];
+  console.log('\n══════════════════════════════════════════\nC29 — FIX1B: hora sin día (varios días) → pregunta el día, no asume\n══════════════════════════════════════════');
+  {
+    const bot = makeBot(histActive);
+    await bot.send('reagendar', { intent: 'REAGENDAR' });
+    await bot.send('sí', { intent: 'CONFIRMAR' });
+    let r = await bot.send('a las 10', { intent: 'REAGENDAR', time: '10:00' });
+    console.log('👤 a las 10\n🤖', r, '\n');
+    check('pregunta "¿Para qué día?"', r.includes('¿Para qué día'));
+    check('NO confirma a ciegas', !r.includes('¿Confirmo?'));
+    r = await bot.send('el lunes', { intent: 'REAGENDAR', date: day3 });
+    console.log('👤 el lunes\n🤖', r, '\n');
+    check('tras elegir el día confirma day3 a las 10:00 AM', r.includes(bl.formatDate(day3)) && r.includes('10:00 AM') && r.includes('¿Confirmo?'));
+  }
+
+  // C30 — FIX2: en confirming, "el lunes" (día distinto) es una CORRECCIÓN, no se
+  // ignora; re-verifica ese día y vuelve a confirmar. (CSV: "Lunes" se ignoraba.)
+  DB = [{ id: 'ap1', status: 'confirmed', customer_name: 'Carlos', appointment_date: tomorrow, start_time: '10:00', barber_id: 'b1', service_id: 's1' }];
+  console.log('\n══════════════════════════════════════════\nC30 — FIX2: corrección de día en confirming (no la ignora)\n══════════════════════════════════════════');
+  {
+    const bot = makeBot(histActive);
+    await bot.send('reagendar', { intent: 'REAGENDAR' });
+    await bot.send('sí', { intent: 'CONFIRMAR' });
+    let r = await bot.send('mañana a las 10', { intent: 'REAGENDAR', date: tomorrow, time: '10:00' });
+    console.log('👤 mañana a las 10\n🤖', r, '\n');
+    check('confirmando mañana 10:00 AM', r.includes(bl.formatDate(tomorrow)) && r.includes('10:00 AM') && r.includes('¿Confirmo?'));
+    r = await bot.send('el lunes', { intent: 'REAGENDAR', date: day3 });
+    console.log('👤 el lunes\n🤖', r, '\n');
+    check('acepta la corrección → confirma day3 10:00 AM', r.includes(bl.formatDate(day3)) && r.includes('10:00 AM') && r.includes('¿Confirmo?'));
+    check('ya NO confirma mañana', !r.includes(bl.formatDate(tomorrow)));
+  }
+
+  // C31 — FIX3: durante rescheduling, una hora suelta que Groq lee como REAGENDAR
+  // NO reinicia el flujo; usa el día en contexto. (CSV: "2:30" volvía a "¿La cambiamos?")
+  DB = [{ id: 'ap1', status: 'confirmed', customer_name: 'Carlos', appointment_date: tomorrow, start_time: '10:00', barber_id: 'b1', service_id: 's1' }];
+  console.log('\n══════════════════════════════════════════\nC31 — FIX3: hora suelta en rescheduling no reinicia\n══════════════════════════════════════════');
+  {
+    const bot = makeBot(histActive);
+    await bot.send('reagendar', { intent: 'REAGENDAR' });
+    await bot.send('sí', { intent: 'CONFIRMAR' });
+    await bot.send('mañana a la 1pm', { intent: 'REAGENDAR', date: tomorrow, time: '13:00' }); // ocupada → acota a mañana
+    let r = await bot.send('2pm', { intent: 'REAGENDAR', time: '14:00' });
+    console.log('👤 2pm\n🤖', r, '\n');
+    check('NO reinicia ("¿La cambiamos?" ausente)', !r.includes('¿La cambiamos?'));
+    check('usa el día en contexto (mañana) y confirma 2:00 PM', r.includes(bl.formatDate(tomorrow)) && r.includes('2:00 PM') && r.includes('¿Confirmo?'));
+  }
+
   console.log('\n══════════════════════════════════════════');
   console.log(FAILED === 0 ? '✅ TODOS LOS CHECKS PASARON' : `❌ ${FAILED} CHECK(S) FALLARON`);
   process.exit(FAILED === 0 ? 0 : 1);

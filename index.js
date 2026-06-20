@@ -356,6 +356,9 @@ async function getClientHistory(phone, businessId) {
 }
 
 async function sendWhatsApp(to, body) {
+  // Log de SALIDA: cada respuesta del bot queda en los logs de Railway (regla de
+  // oro). Así un fallo en vivo se diagnostica sin depender del CSV de Twilio.
+  console.log(`[${to}] → ${body}`);
   await twilioClient.messages.create({
     from: process.env.TWILIO_WHATSAPP_FROM,
     to: `whatsapp:${to}`,
@@ -396,6 +399,20 @@ async function understand(message, services, barbers, state, offeredCtx, hoursCt
     : '';
   const hours = hoursCtx ? `\nHorario del barbero: ${hoursCtx}. Úsalo para interpretar la hora.` : '';
 
+  // Calendario de referencia: el modelo NUNCA hace aritmética de fechas; copia la
+  // fecha YYYY-MM-DD EXACTA de esta tabla cuando el cliente menciona un día. 8 días
+  // (hoy + 7) cubren las 7 etiquetas de día de la semana sin ambigüedad.
+  const dows = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
+  const baseToday = new Date(todayPR() + 'T12:00:00');
+  const calRows = [];
+  for (let off = 0; off <= 7; off++) {
+    const dd = new Date(baseToday); dd.setDate(baseToday.getDate() + off);
+    const ds = dd.toISOString().split('T')[0];
+    const alias = off === 0 ? `hoy (${dows[dd.getDay()]})` : off === 1 ? `mañana (${dows[dd.getDay()]})` : dows[dd.getDay()];
+    calRows.push(`${alias} = ${ds}`);
+  }
+  const calendar = `\nHoy es ${dows[baseToday.getDay()]} ${todayPR()}. Calendario de referencia (usa la fecha EXACTA YYYY-MM-DD de esta tabla):\n${calRows.join('\n')}`;
+
   const sys = `Eres el cerebro de un bot de citas de barbería en Puerto Rico. Analiza el mensaje EN CONTEXTO y devuelve SOLO JSON:
 {"intent":"NUEVA_CITA|REAGENDAR|CANCELAR|VER_CITA|CONFIRMAR|NEGAR|PREGUNTA_GENERAL|FUERA_DE_CONTEXTO|UNKNOWN","name":string|null,"service":string|null,"barber":string|null,"date":string|null,"time":string|null,"choice":number|null,"ampm_ambiguous":boolean}
 
@@ -415,14 +432,14 @@ intent (si es sobre la barbería):
 name: nombre del cliente si aparece. null si no.
 service: SOLO de esta lista exacta: ${svc}. null si no lo menciona.
 barber: SOLO si pide con quién atenderse (de: ${bar || 'ninguno'}). null si no.
-date: "today","tomorrow", día de semana en español, o YYYY-MM-DD. null si no.
+date: SIEMPRE en formato YYYY-MM-DD tomado del calendario de referencia de abajo. Si el cliente menciona un día ("lunes","el sábado","mañana","hoy","este lunes"), busca esa fila y devuelve su fecha EXACTA. NUNCA devuelvas "lunes","monday","mañana" ni texto libre: solo YYYY-MM-DD o null.
 time: la hora EXACTA que pidió el cliente, en "HH:MM" 24h. null si no menciona hora.
   · Si menciona una hora ("6pm","las 6","a las 10"), SIEMPRE ponla en "time" y NO uses "choice".
   · NUNCA ajustes/redondees la hora a una opción de la lista: devuelve la hora LITERAL que pidió.
   · Desambigua AM/PM con el horario del barbero (ej "las 6" con horario 10:00–19:00 → "18:00").
 choice: posición 1-based SOLO si elige por orden sin mencionar hora ("el primero"=1). null si menciona una hora.
 ampm_ambiguous: true SOLO si la hora cabe tanto en AM como en PM dentro del horario y no puedes decidir; si no, false.
-Estado actual del bot: ${state}.${hint ? ' ' + hint : ''}${hours}${offered}
+Estado actual del bot: ${state}.${hint ? ' ' + hint : ''}${hours}${offered}${calendar}
 No inventes datos que no estén en el mensaje.`;
 
   try {
@@ -1073,7 +1090,7 @@ app.post('/webhook', validateTwilioSignature, async (req, res) => {
   }
 });
 
-app.get('/health', (_, res) => res.json({ status: 'ok', version: '4.4.1-booking-link-tenant-safe' }));
+app.get('/health', (_, res) => res.json({ status: 'ok', version: '4.5.0-reschedule-day-fix' }));
 
 app.post('/admin/report', async (req, res) => {
   const { type = 'bihourly' } = req.body;
@@ -1105,7 +1122,7 @@ console.log('✅ Cron jobs registered');
 // ── Server ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
-  console.log('✅ BarberBot v4.3.1-no-repeat-slots started');
+  console.log('✅ BarberBot v4.5.0-reschedule-day-fix started');
   console.log(`🚀 Server running on port ${PORT}`);
 });
 

@@ -399,6 +399,50 @@ async function respond({ session, msg, understood, ctx, deps }) {
       return (up[0] && up[0].date) || todayPR();
     }
 
+    // FIX 1: día objetivo cuando el cliente dio una HORA. Si Groq trajo un día
+    // resoluble (ya en YYYY-MM-DD), ese manda. Si NO, NUNCA asumimos a ciegas:
+    //  1) si todo lo ofrecido es de un mismo día → ese es el día en contexto;
+    //  2) si el barbero solo tiene UN día próximo con cupo real → ese;
+    //  3) varios días posibles → null (hay que preguntar cuál).
+    async function resolveTargetDate() {
+      const fromToken = resolveDateToken(understood.date);
+      if (fromToken) return fromToken;
+      const offDates = [...new Set(offered.map(o => o.date).filter(Boolean))];
+      if (offDates.length === 1) return offDates[0];
+      const up = await deps.getUpcoming(bk.barberId, 3, 3);
+      const days = (up || []).filter(g => g.slots && g.slots.length);
+      if (days.length === 1) return days[0].date;
+      return null;
+    }
+
+    // FIX 1: pregunta "¿para qué día?" con los días REALES del barbero (no asume).
+    // Cada opción guarda la MISMA hora pedida, así "2" o el nombre del día confirman.
+    async function askWhichDay(time) {
+      const up = await deps.getUpcoming(bk.barberId, 3, 3);
+      const days = (up || []).filter(g => g.slots && g.slots.length);
+      if (!days.length) return await offerSlots(forReschedule);
+      if (days.length === 1) return await confirmSlot(days[0].date, time, forReschedule);
+      d.offered = days.map(g => ({ date: g.date, time }));
+      d.negotiation = 0;
+      const opts = days.map((g, i) => `${i + 1}. ${displayDay(g.date)}`).join('\n');
+      return out(
+        `¿Para qué día las ${formatTime(time)}? 😊\n${opts}\n(responde el número o el día)`,
+        forReschedule ? 'rescheduling' : 'picking_slot'
+      );
+    }
+
+    // FIX 1: respuesta a "¿para qué día?" — lo ofrecido son VARIOS días con una
+    // misma hora y el cliente da un día → confirmar esa hora en el día elegido.
+    {
+      const offDates = [...new Set(offered.map(o => o.date))];
+      const offTimes = [...new Set(offered.map(o => o.time))];
+      if (understood.date && !understood.time && offDates.length > 1 && offTimes.length === 1) {
+        const dt = resolveDateToken(understood.date);
+        const hit = dt && offered.find(o => o.date === dt);
+        if (hit) return await confirmSlot(hit.date, hit.time, forReschedule);
+      }
+    }
+
     // 0. AM/PM ambiguo → preguntar una vez (sin asumir).
     if (understood.time && understood.ampm_ambiguous) {
       const date = resolveDateToken(understood.date) || await defaultDate();
@@ -409,10 +453,13 @@ async function respond({ session, msg, understood, ctx, deps }) {
       const sel = offered[choiceNum - 1];
       return await confirmSlot(sel.date, sel.time, forReschedule);
     }
-    // 2. Hora explícita → verificar vs DB. Sin día → primer día disponible (BUG 1).
+    // 2. Hora explícita → verificar vs DB. El día: el que dijo el cliente; si no
+    //    dio día resoluble, resolveTargetDate decide sin asumir a ciegas (FIX 1).
+    //    Si hay varios días posibles → preguntamos cuál en vez de elegir el primero.
     if (understood.time) {
       const t = normalizeTime(understood.time);
-      const targetDate = resolveDateToken(understood.date) || await defaultDate();
+      const targetDate = await resolveTargetDate();
+      if (!targetDate) return await askWhichDay(t);
       return await confirmSlot(targetDate, t, forReschedule);
     }
     // 3. Día específico → lista NUMERADA con TODOS los cupos de ese día (BUG 3).
@@ -574,6 +621,18 @@ async function respond({ session, msg, understood, ctx, deps }) {
       resetData();
       return out(`¡Perfecto, te esperamos! 💈`, 'idle');
     }
+    // FIX 2: corrección de día/hora durante la confirmación de un horario. Si el
+    // cliente menciona un día o una hora DISTINTOS a los que se confirman, es una
+    // corrección (no un sí/no): re-verificamos contra el horario real del barbero
+    // ese día y volvemos a confirmar. (No aplica a cancelar.)
+    if ((action === 'reschedule' || action === 'create') && d.bk && (understood.date || understood.time)) {
+      const newDate = resolveDateToken(understood.date) || d.bk.date;
+      const newTime = normalizeTime(understood.time) || d.bk.time;
+      if (newDate !== d.bk.date || newTime !== d.bk.time) {
+        d.pendingAction = null;
+        return await confirmSlot(newDate, newTime, action === 'reschedule');
+      }
+    }
     // Ambiguo: preguntar UNA vez más, distinto. NUNCA ejecutar lo opuesto.
     if (action === 'cancel') return out(`Solo para estar seguro 🙂 ¿cancelo tu cita? Responde *sí* o *no*.`);
     if (action === 'reschedule_start') return out(`¿Quieres cambiar tu cita? Responde *sí* o *no* 🙂`);
@@ -608,7 +667,10 @@ async function respond({ session, msg, understood, ctx, deps }) {
   //    actual (pickSlot/collecting) y re-elegir horario sin perder el contexto.
   const inCreateFlow = session.state === 'collecting' || session.state === 'picking_slot';
   if (!inCreateFlow) {
-    if (I === 'REAGENDAR') return await startReschedule();
+    // FIX 3: si YA estamos eligiendo nuevo horario (rescheduling), un mensaje que
+    // Groq lee como REAGENDAR (p.ej. una hora suelta "2:30") NO reinicia el flujo
+    // — cae a pickSlot(true) y se trata como elección de horario en el día actual.
+    if (I === 'REAGENDAR' && session.state !== 'rescheduling') return await startReschedule();
     if (I === 'CANCELAR')  return await startCancel();
     if (I === 'VER_CITA')  return await showAppointment();
   }
