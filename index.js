@@ -964,7 +964,14 @@ async function handleMessage(phone, message, businessId) {
         const { error } = await supabase.from('appointments')
           .update({ appointment_date: date, start_time: time, end_time: endTime })
           .eq('id', apptId);
-        if (error) { console.error('[commitReschedule]', error.message); return { ok: false }; }
+        if (error) {
+          console.error('[commitReschedule]', error.code, error.message);
+          // 23505: el índice único rechazó el nuevo slot (otro cliente lo tomó en
+          // la carrera entre checkSlot y el UPDATE). Igual que en create: lo
+          // distinguimos para re-ofrecer horarios en vez de un error genérico.
+          if (error.code === '23505') return { ok: false, reason: 'taken' };
+          return { ok: false };
+        }
         await suppressBotTemplate(apptId, 'rescheduled');
         return { ok: true };
       },

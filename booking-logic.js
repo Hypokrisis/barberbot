@@ -648,6 +648,14 @@ async function respond({ session, msg, understood, ctx, deps }) {
         const bk = d.bk;
         const endTime = addDuration(bk.time, bk.serviceDuration);
         const r = await deps.commitReschedule(d.reschedule.apptId, bk.date, bk.time, endTime);
+        // Carrera perdida en reagendar: el slot se ocupó entre mostrar y confirmar.
+        // NO reseteamos (conserva bk Y d.reschedule.apptId): re-ofrecemos horarios
+        // para re-elegir, en vez de un error seco. (Backstop: índice único DB.)
+        if (!r.ok && r.reason === 'taken') {
+          const takenTime = bk.time;
+          d.pendingAction = null;
+          return await offerSlots(true, `Uy, alguien acaba de tomar las ${formatTime(takenTime)} 😕`);
+        }
         const { name, date, time } = bk;
         resetData();
         if (!r.ok) return out(`Hubo un error al reagendar 😕 Intenta de nuevo en un momento.`, 'idle');

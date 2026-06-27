@@ -529,6 +529,31 @@ async function run(title, history, turns) {
     check('vuelve a idle', session.state === 'idle');
   }
 
+  // C35 — FIX5: carrera perdida al REAGENDAR (commitReschedule → 23505). NO dice
+  // "error al reagendar"; re-ofrece horarios conservando la cita a reagendar.
+  console.log('\n══════════════════════════════════════════\nC35 — FIX5: carrera perdida al reagendar (23505) → re-ofrece, no error seco\n══════════════════════════════════════════');
+  {
+    DB = [{ id: 'ap1', status: 'confirmed', customer_name: 'Carlos', appointment_date: tomorrow, start_time: '10:00', barber_id: 'b1', service_id: 's1' }];
+    const session = { state: 'idle', data: {} };
+    let rescheduleCalls = 0;
+    const deps = {
+      ...makeDeps(),
+      commitReschedule: async () => { rescheduleCalls++; return { ok: false, reason: 'taken' }; },
+    };
+    const ctx = { business, services, barbers, bookingLink, history: histActive, phone: '+17875551234' };
+    const send = (msg, u) => bl.respond({ session, msg, understood: u || { intent: 'UNKNOWN' }, ctx, deps });
+    await send('reagendar', { intent: 'REAGENDAR' });
+    await send('sí', { intent: 'CONFIRMAR' });                       // → horarios
+    await send('mañana a las 11', { intent: 'NUEVA_CITA', date: tomorrow, time: '11:00' }); // → confirmar
+    const r = await send('sí', { intent: 'CONFIRMAR' });             // commitReschedule → taken
+    console.log('👤 sí (pero el slot se tomó)\n🤖', r, '\n');
+    check('intentó el UPDATE', rescheduleCalls === 1);
+    check('NO dice "error al reagendar"', !r.includes('error al reagendar'));
+    check('avisa que el turno se tomó', r.includes('acaba de tomar'));
+    check('re-ofrece y vuelve a rescheduling', r.includes('tiene espacio') && session.state === 'rescheduling');
+    check('conserva la cita a reagendar (d.reschedule.apptId)', session.data.reschedule && session.data.reschedule.apptId === 'ap1');
+  }
+
   console.log('\n══════════════════════════════════════════');
   console.log(FAILED === 0 ? '✅ TODOS LOS CHECKS PASARON' : `❌ ${FAILED} CHECK(S) FALLARON`);
   process.exit(FAILED === 0 ? 0 : 1);
