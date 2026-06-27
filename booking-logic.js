@@ -139,6 +139,18 @@ function matchBarber(name, barbers) {
       || barbers.find(b => b.name.toLowerCase().split(/\s+/).some(w => w.startsWith(n)))
       || null;
 }
+// Match ESTRICTO (exacto o prefijo en cualquier dirección, ≥3 letras) para
+// rescatar un nombre suelto desde el mensaje crudo cuando Groq no lo extrajo.
+// A diferencia de matchBarber, NO usa "includes" — evita que "nada"/"como"
+// casen por substring con un barbero. Se usa solo sobre palabras sueltas.
+function matchStrict(word, items) {
+  const w = String(word || '').toLowerCase().trim().replace(/[^\p{L}\p{N}]/gu, '');
+  if (w.length < 3) return null;
+  return items.find(it => it.name.toLowerCase() === w)
+      || items.find(it => { const n = it.name.toLowerCase(); return n.startsWith(w) || w.startsWith(n); })
+      || items.find(it => it.name.toLowerCase().split(/\s+/).some(p => p.length >= 3 && (p.startsWith(w) || w.startsWith(p))))
+      || null;
+}
 
 // ── Helpers de slots ──────────────────────────────────────────────────────────
 function spreadSlots(slots, n = 4) {
@@ -492,10 +504,27 @@ async function respond({ session, msg, understood, ctx, deps }) {
     return await offerSlots(forReschedule);
   }
 
+  // Red de seguridad determinista: Groq (llama-3.1-8b) a veces NO extrae un
+  // barbero/servicio cuando el cliente responde SOLO con el nombre (ej: el bot
+  // pide "¿con qué barbero?" y el cliente escribe "pacheco" a secas → Groq
+  // devolvía barber:null). Si el mensaje es UNA sola palabra y rellena justo el
+  // dato que falta, lo casamos aquí sin depender de Groq. Gated para evitar
+  // falsos positivos: el barbero solo se rescata cuando nombre+servicio ya están
+  // (así una palabra suelta no es el nombre del cliente).
+  function recoverSingleWord(bk) {
+    if (String(msg).trim().split(/\s+/).length !== 1) return; // solo palabras sueltas
+    if (bk.name && bk.serviceId && !bk.barberId && barbers.length > 1) {
+      const b = matchStrict(msg, barbers); if (b) setBarber(bk, b);
+    } else if (bk.name && !bk.serviceId) {
+      const s = matchStrict(msg, services); if (s) setService(bk, s);
+    }
+  }
+
   // Pide lo que falte (nombre/servicio/barbero) o pasa a ofrecer horarios.
   async function advanceCollecting() {
     const bk = d.bk || (d.bk = {});
     if (!bk.barberId && barbers.length === 1) setBarber(bk, barbers[0]);
+    recoverSingleWord(bk);
 
     const missing = [];
     if (!bk.name) missing.push('tu nombre');
@@ -760,6 +789,6 @@ module.exports = {
   respond,
   // helpers expuestos para tests / index.js
   todayPR, formatDate, formatTime, shortDate, displayDay, resolveDateToken, normalizeTime,
-  addDuration, matchService, matchBarber, spreadSlots, nearestSlots, joinNatural, titleCase,
+  addDuration, matchService, matchBarber, matchStrict, spreadSlots, nearestSlots, joinNatural, titleCase,
   isGreeting, wantsToAsk, isInvalidDateToken, isRealDate,
 };

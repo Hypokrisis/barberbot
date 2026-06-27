@@ -460,6 +460,36 @@ async function run(title, history, turns) {
     check('usa el día en contexto (mañana) y confirma 2:00 PM', r.includes(bl.formatDate(tomorrow)) && r.includes('2:00 PM') && r.includes('¿Confirmo?'));
   }
 
+  // C32 — BUG transcript en vivo: Groq NO extrae un barbero suelto ("pacheco") y
+  // el bot se quedaba pegado en "Todavía me falta el barbero". La red de seguridad
+  // determinista (recoverSingleWord) lo rescata aunque understood.barber sea null.
+  console.log('\n══════════════════════════════════════════\nC32 — BUG: barbero suelto que Groq no extrajo (understood.barber=null)\n══════════════════════════════════════════');
+  {
+    const bp = [{ id: 'b1', name: 'Pepe' }, { id: 'b2', name: 'Pablo' }, { id: 'b3', name: 'Pacheco' }];
+    const AV = { b3: { [tomorrow]: ['10:00', '11:00'] } };
+    const dayAvail = async (id, date) => {
+      const set = new Set((AV[id] || {})[date] || []);
+      const all = genSlots('10:00', '19:00');
+      return { closed: false, open: '10:00', close: '19:00', available: all.filter(s => set.has(s)), booked: all.filter(s => !set.has(s)) };
+    };
+    const upcoming = async (id) => { const s = (AV[id] || {})[tomorrow] || []; return s.length ? [{ date: tomorrow, slots: s.slice(0, 2) }] : []; };
+    const session = { state: 'idle', data: {} };
+    const ctx = { business, services, barbers: bp, bookingLink, history: { hasHistory: true, name: 'Loann', activeAppointment: null }, phone: '+17875551234' };
+    const deps = { ...makeDeps(), getDayAvailability: dayAvail, getUpcoming: upcoming, getSlots: async (id, d) => (await dayAvail(id, d)).available };
+    const send = (msg, u) => bl.respond({ session, msg, understood: u || { intent: 'UNKNOWN' }, ctx, deps });
+    let r;
+    r = await send('quiero agendar una cita', { intent: 'NUEVA_CITA' });        console.log('👤 quiero agendar una cita\n🤖', r, '\n');
+    r = await send('dame el corte moderno', { intent: 'NUEVA_CITA', service: 'Corte moderno' }); console.log('👤 dame el corte moderno\n🤖', r, '\n');
+    check('tras el servicio pide el barbero', r.includes('barbero'));
+    // Groq falla aquí: barber:null pese a que "pacheco" está en la lista
+    r = await send('pacheco', { intent: 'NUEVA_CITA', barber: null });           console.log('👤 pacheco\n🤖', r, '\n');
+    check('NO se queda pegado en "me falta el barbero"', !/falta.*barbero/i.test(r));
+    check('avanza a ofrecer horarios de Pacheco', r.includes('Pacheco') && (session.state === 'picking_slot' || r.includes('tiene espacio')));
+    // matchStrict directo: rescata "pacheco" pero NO falsos positivos
+    check('matchStrict("pacheco") → Pacheco', (bl.matchStrict('pacheco', bp) || {}).name === 'Pacheco');
+    check('matchStrict("nada") → null (no falso positivo por includes)', bl.matchStrict('nada', bp) === null);
+  }
+
   console.log('\n══════════════════════════════════════════');
   console.log(FAILED === 0 ? '✅ TODOS LOS CHECKS PASARON' : `❌ ${FAILED} CHECK(S) FALLARON`);
   process.exit(FAILED === 0 ? 0 : 1);

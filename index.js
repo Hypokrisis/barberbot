@@ -388,7 +388,7 @@ async function understand(message, services, barbers, state, offeredCtx, hoursCt
   const bar = barbers.map(b => b.name).join(', ');
   const inFlow = ['collecting', 'picking_slot', 'confirming', 'rescheduling'].includes(state);
   const hint = ({
-    collecting:   'El bot está juntando nombre, servicio y barbero. Una palabra suelta suele ser el nombre del cliente o el barbero pedido.',
+    collecting:   'El bot está juntando nombre, servicio y barbero. Si una palabra suelta coincide con un barbero de la lista, ponla en "barber"; si coincide con un servicio, en "service"; si no coincide con ninguno, es el nombre del cliente ("name").',
     picking_slot: 'El bot ofreció horarios. Un número, una hora o una posición ("el primero") es la elección (intent NUEVA_CITA).',
     rescheduling: 'El bot ofreció horarios para reagendar. Un número, una hora o una posición ("el primero") es la elección.',
     confirming:   'El bot pidió confirmar (sí/no). "sí/dale/ok/eso/va/perfecto"=CONFIRMAR, "no/mejor no/nah/qué va"=NEGAR.',
@@ -431,7 +431,7 @@ intent (si es sobre la barbería):
 - UNKNOWN: sobre la barbería pero no está claro qué quiere
 name: nombre del cliente si aparece. null si no.
 service: SOLO de esta lista exacta: ${svc}. null si no lo menciona.
-barber: SOLO si pide con quién atenderse (de: ${bar || 'ninguno'}). null si no.
+barber: el barbero que el cliente pide o nombra, SOLO de esta lista: ${bar || 'ninguno'}. Si el mensaje es solo un nombre de esa lista ("pacheco","pablo","con pepe"), DEVUÉLVELO aquí. null si no nombra a ninguno.
 date: SIEMPRE en formato YYYY-MM-DD tomado del calendario de referencia de abajo. Si el cliente menciona un día ("lunes","el sábado","mañana","hoy","este lunes"), busca esa fila y devuelve su fecha EXACTA. NUNCA devuelvas "lunes","monday","mañana" ni texto libre: solo YYYY-MM-DD o null.
 time: la hora EXACTA que pidió el cliente, en "HH:MM" 24h. null si no menciona hora.
   · Si menciona una hora ("6pm","las 6","a las 10"), SIEMPRE ponla en "time" y NO uses "choice".
