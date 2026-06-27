@@ -33,19 +33,25 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 // ── Session store (Supabase-backed, in-memory cache) ─────────────────────────
 // Survives Railway restarts. TTL: 30 min inactivity.
-const sessions = {}; // in-memory cache: phone → session
+// FIX 3 — La sesión se llave por (business_id, phone), NO solo por phone: un mismo
+// cliente que escribe a 2 barberías (2 números Twilio) debe tener una sesión
+// SEPARADA por negocio. Antes compartían una sola → el bk (barberId/serviceId) de
+// un negocio se filtraba al otro. Requiere bot_sessions con (phone, business_id) único.
+const sessions = {}; // in-memory cache: `${businessId}:${phone}` → session
 const SESSION_TTL = 30 * 60 * 1000; // 30 minutes
+const sessKey = (phone, businessId) => `${businessId}:${phone}`;
 
-async function getSession(phone) {
+async function getSession(phone, businessId) {
   const now = Date.now();
+  const key = sessKey(phone, businessId);
 
   // 1. Check warm cache
-  if (sessions[phone]) {
-    if (now - sessions[phone].lastActivity > SESSION_TTL) {
-      delete sessions[phone]; // expired in cache
+  if (sessions[key]) {
+    if (now - sessions[key].lastActivity > SESSION_TTL) {
+      delete sessions[key]; // expired in cache
     } else {
-      sessions[phone].lastActivity = now;
-      return sessions[phone];
+      sessions[key].lastActivity = now;
+      return sessions[key];
     }
   }
 
@@ -55,6 +61,7 @@ async function getSession(phone) {
       .from('bot_sessions')
       .select('state, data, history, updated_at')
       .eq('phone', phone)
+      .eq('business_id', businessId)
       .maybeSingle();
 
     if (data) {
@@ -66,7 +73,7 @@ async function getSession(phone) {
           history: data.history || [],
           lastActivity: now,
         };
-        sessions[phone] = session;
+        sessions[key] = session;
         return session;
       }
     }
@@ -76,24 +83,25 @@ async function getSession(phone) {
 
   // 3. New / expired session
   const fresh = { state: 'idle', data: {}, history: [], lastActivity: now };
-  sessions[phone] = fresh;
+  sessions[key] = fresh;
   return fresh;
 }
 
-async function saveSession(phone, session) {
+async function saveSession(phone, session, businessId) {
   session.lastActivity = Date.now();
-  sessions[phone] = session; // keep cache warm
+  sessions[sessKey(phone, businessId)] = session; // keep cache warm
 
   try {
     await supabase
       .from('bot_sessions')
       .upsert({
         phone,
+        business_id: businessId,
         state: session.state,
         data: session.data,
         history: session.history || [],
         updated_at: new Date().toISOString(),
-      }, { onConflict: 'phone' });
+      }, { onConflict: 'phone,business_id' });
   } catch (err) {
     console.error('[Session] DB save error (non-fatal):', err.message);
     // Non-fatal: in-memory cache still works until restart
@@ -872,7 +880,7 @@ async function suppressBotTemplate(appointmentId, eventType) {
 }
 
 async function handleMessage(phone, message, businessId) {
-  const session = await getSession(phone);
+  const session = await getSession(phone, businessId);
   const { business, barbers, services } = await getBusinessInfo(businessId);
   const msg = message.trim();
   const bookingLink = bookingLinkFor(business);
@@ -1105,13 +1113,16 @@ app.post('/webhook', validateTwilioSignature, async (req, res) => {
     // Serializado por teléfono: el ciclo leer-sesión → procesar → guardar →
     // responder corre en serie para este número (evita carreras y citas dobles).
     await withPhoneLock(phone, async () => {
-      const reply = await handleMessage(phone, Body, twilioSettings.business_id);
-      // Persist session after every message (write-through)
-      if (sessions[phone]) await saveSession(phone, sessions[phone]);
+      const bId = twilioSettings.business_id;
+      const reply = await handleMessage(phone, Body, bId);
+      // Persist session after every message (write-through). La sesión se llave
+      // por (business_id, phone) — usar la MISMA clave para guardar (FIX 3).
+      const key = sessKey(phone, bId);
+      if (sessions[key]) await saveSession(phone, sessions[key], bId);
       await sendWhatsApp(phone, reply);
       // Medición de uso: 1 entrante procesado + 1 respuesta enviada
-      await bumpUsage(twilioSettings.business_id, 'inbound', 1);
-      await bumpUsage(twilioSettings.business_id, 'outbound', 1);
+      await bumpUsage(bId, 'inbound', 1);
+      await bumpUsage(bId, 'outbound', 1);
     });
   } catch (err) {
     console.error('Webhook error:', err);
