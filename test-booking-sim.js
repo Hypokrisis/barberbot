@@ -509,6 +509,26 @@ async function run(title, history, turns) {
     check('conserva barbero/servicio (bk intacto)', session.data.bk && session.data.bk.barberId === 'b1' && session.data.bk.serviceId === 's1');
   }
 
+  // C34 — FIX4: aparece una cita activa a mitad del flujo (p.ej. reserva por web)
+  // → al confirmar la NUEVA, el chokepoint la bloquea (REGLA #1) y NO crea 2ª.
+  console.log('\n══════════════════════════════════════════\nC34 — FIX4: cita activa que aparece a mitad → no crea 2ª (REGLA #1)\n══════════════════════════════════════════');
+  {
+    DB = [];
+    const session = { state: 'idle', data: {} };
+    const deps = makeDeps(); // commitCreate empuja a DB; getActiveAppointments lee DB
+    const ctx = { business, services, barbers, bookingLink, history: { hasHistory: false }, phone: '+17875551234' };
+    const send = (msg, u) => bl.respond({ session, msg, understood: u || { intent: 'UNKNOWN' }, ctx, deps });
+    let r = await send('soy Ivy corte moderno con Pepe mañana a las 10', { intent: 'NUEVA_CITA', name: 'Ivy', service: 'Corte moderno', barber: 'Pepe', date: 'tomorrow', time: '10:00' });
+    console.log('👤 soy Ivy ... mañana a las 10\n🤖', r, '\n');
+    // Simula que entró una cita por OTRO canal (web) mientras armaba esta:
+    DB.push({ id: 'web1', status: 'confirmed', customer_name: 'Ivy', appointment_date: tomorrow, start_time: '14:00', barber_id: 'b1', service_id: 's1' });
+    r = await send('sí', { intent: 'CONFIRMAR' });
+    console.log('👤 sí (pero ya tiene cita por web)\n🤖', r, '\n');
+    check('bloquea con "una cita activa" / "una a la vez"', r.includes('cita activa') && r.includes('una a la vez'));
+    check('NO creó una 2ª cita (sigue 1 sola en DB)', DB.length === 1);
+    check('vuelve a idle', session.state === 'idle');
+  }
+
   console.log('\n══════════════════════════════════════════');
   console.log(FAILED === 0 ? '✅ TODOS LOS CHECKS PASARON' : `❌ ${FAILED} CHECK(S) FALLARON`);
   process.exit(FAILED === 0 ? 0 : 1);

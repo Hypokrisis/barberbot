@@ -620,6 +620,15 @@ async function respond({ session, msg, understood, ctx, deps }) {
       if (action === 'reschedule_start') return await offerSlots(true); // → horarios
       if (action === 'create') {
         const bk = d.bk;
+        // FIX 4 — REGLA #1 defendida en el chokepoint: si apareció una cita activa
+        // mientras el cliente armaba esta (p.ej. reservó por web/dashboard a mitad
+        // del flujo), NO creamos una segunda. El guard de idle/CASO A se evaluó al
+        // inicio y no se revalida; aquí es el último punto antes de insertar.
+        const existing = await deps.getActiveAppointments();
+        if (existing && existing.length) {
+          resetData();
+          return out(`Vi que ya tienes una cita activa 😊 Solo puedes tener una a la vez. ¿Quieres *cambiarla* o *cancelarla*?`, 'idle');
+        }
         const endTime = addDuration(bk.time, bk.serviceDuration);
         const r = await deps.commitCreate({ name: bk.name, serviceId: bk.serviceId, barberId: bk.barberId, date: bk.date, startTime: bk.time, endTime });
         // Carrera perdida: el slot se ocupó entre que lo mostramos y confirmó. NO
