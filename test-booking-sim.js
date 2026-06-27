@@ -490,6 +490,25 @@ async function run(title, history, turns) {
     check('matchStrict("nada") → null (no falso positivo por includes)', bl.matchStrict('nada', bp) === null);
   }
 
+  // C33 — FIX1: el slot se ocupó entre mostrar y confirmar (commitCreate → 23505).
+  // El bot NO dice "no pude guardar"; re-ofrece horarios conservando barbero/servicio.
+  DB = [];
+  console.log('\n══════════════════════════════════════════\nC33 — FIX1: carrera perdida (23505) → re-ofrece, no error seco\n══════════════════════════════════════════');
+  {
+    const session = { state: 'idle', data: {} };
+    const deps = { ...makeDeps(), commitCreate: async () => ({ ok: false, reason: 'taken' }) };
+    const ctx = { business, services, barbers, bookingLink, history: { hasHistory: false }, phone: '+17875551234' };
+    const send = (msg, u) => bl.respond({ session, msg, understood: u || { intent: 'UNKNOWN' }, ctx, deps });
+    let r = await send('soy Zoe corte moderno con Pepe mañana a las 10', { intent: 'NUEVA_CITA', name: 'Zoe', service: 'Corte moderno', barber: 'Pepe', date: 'tomorrow', time: '10:00' });
+    console.log('👤 soy Zoe ... mañana a las 10\n🤖', r, '\n');
+    r = await send('sí', { intent: 'CONFIRMAR' });
+    console.log('👤 sí\n🤖', r, '\n');
+    check('NO dice "no pude guardar"', !r.includes('no pude guardar'));
+    check('avisa que el turno se tomó', r.includes('acaba de tomar'));
+    check('re-ofrece horarios y vuelve a picking_slot', r.includes('tiene espacio') && session.state === 'picking_slot');
+    check('conserva barbero/servicio (bk intacto)', session.data.bk && session.data.bk.barberId === 'b1' && session.data.bk.serviceId === 's1');
+  }
+
   console.log('\n══════════════════════════════════════════');
   console.log(FAILED === 0 ? '✅ TODOS LOS CHECKS PASARON' : `❌ ${FAILED} CHECK(S) FALLARON`);
   process.exit(FAILED === 0 ? 0 : 1);

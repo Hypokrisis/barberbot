@@ -940,7 +940,15 @@ async function handleMessage(phone, message, businessId) {
           customerName: bk.name, customerPhone: phone,
           date: bk.date, startTime: bk.startTime, endTime: bk.endTime,
         });
-        if (error || !appt) { console.error('[commitCreate]', error?.message); return { ok: false }; }
+        if (error || !appt) {
+          console.error('[commitCreate]', error?.code, error?.message);
+          // 23505 = unique_violation: el índice único de la DB rechazó el slot
+          // porque otro cliente lo tomó entre que se lo mostramos y confirmó
+          // (carrera real, backstop irrompible). Lo distinguimos del error genérico
+          // para re-ofrecer horarios en vez de decir "no pude guardar".
+          if (error && error.code === '23505') return { ok: false, reason: 'taken' };
+          return { ok: false };
+        }
         await suppressBotTemplate(appt.id, 'created'); // el bot ya confirmó aquí
         return { ok: true };
       },

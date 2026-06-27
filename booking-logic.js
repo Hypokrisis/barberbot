@@ -622,6 +622,14 @@ async function respond({ session, msg, understood, ctx, deps }) {
         const bk = d.bk;
         const endTime = addDuration(bk.time, bk.serviceDuration);
         const r = await deps.commitCreate({ name: bk.name, serviceId: bk.serviceId, barberId: bk.barberId, date: bk.date, startTime: bk.time, endTime });
+        // Carrera perdida: el slot se ocupó entre que lo mostramos y confirmó. NO
+        // reseteamos el bk (conserva barbero/servicio): re-ofrecemos horarios para
+        // que re-elija, en vez de soltar un error seco. (Backstop: índice único DB.)
+        if (!r.ok && r.reason === 'taken') {
+          const takenTime = bk.time;
+          d.pendingAction = null;
+          return await offerSlots(false, `Uy, alguien acaba de tomar las ${formatTime(takenTime)} 😕`);
+        }
         const { name, date, time } = bk;
         resetData();
         if (!r.ok) return out(`Uy, no pude guardar la cita 😕 Intenta de nuevo en un momento.`, 'idle');
