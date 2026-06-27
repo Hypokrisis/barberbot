@@ -1011,6 +1011,23 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
+// ── Serialización por teléfono (candado en memoria) ───────────────────────────
+// Dos mensajes casi simultáneos del MISMO número corrían en paralelo: como la
+// sesión es un objeto compartido y `state` solo cambia tras los await, dos "sí"
+// rápidos podían crear 2 citas / corromper el estado. Encadenamos el ciclo
+// read-modify-write por teléfono para que se procesen en serie (orden de llegada).
+// Alcance: 1 proceso (deploy actual = instancia única). Entre instancias el
+// backstop sigue siendo el índice único de la DB (uniq_appointment_slot).
+const phoneLocks = new Map(); // phone → última promesa en la cola
+function withPhoneLock(phone, fn) {
+  const prev = phoneLocks.get(phone) || Promise.resolve();
+  const run = prev.then(fn, fn); // corre fn pase lo que pase con el anterior
+  const tail = run.catch(() => {}); // cola que nunca rechaza (para encadenar)
+  phoneLocks.set(phone, tail);
+  tail.finally(() => { if (phoneLocks.get(phone) === tail) phoneLocks.delete(phone); });
+  return run; // el caller ve el resultado/rechazo real de SU fn
+}
+
 // ── Contador de uso de mensajes por negocio (solo medición) ───────────────────
 async function bumpUsage(businessId, direction, n = 1) {
   if (!businessId) return;
@@ -1085,13 +1102,17 @@ app.post('/webhook', validateTwilioSignature, async (req, res) => {
       return;
     }
 
-    const reply = await handleMessage(phone, Body, twilioSettings.business_id);
-    // Persist session after every message (write-through)
-    if (sessions[phone]) await saveSession(phone, sessions[phone]);
-    await sendWhatsApp(phone, reply);
-    // Medición de uso: 1 entrante procesado + 1 respuesta enviada
-    await bumpUsage(twilioSettings.business_id, 'inbound', 1);
-    await bumpUsage(twilioSettings.business_id, 'outbound', 1);
+    // Serializado por teléfono: el ciclo leer-sesión → procesar → guardar →
+    // responder corre en serie para este número (evita carreras y citas dobles).
+    await withPhoneLock(phone, async () => {
+      const reply = await handleMessage(phone, Body, twilioSettings.business_id);
+      // Persist session after every message (write-through)
+      if (sessions[phone]) await saveSession(phone, sessions[phone]);
+      await sendWhatsApp(phone, reply);
+      // Medición de uso: 1 entrante procesado + 1 respuesta enviada
+      await bumpUsage(twilioSettings.business_id, 'inbound', 1);
+      await bumpUsage(twilioSettings.business_id, 'outbound', 1);
+    });
   } catch (err) {
     console.error('Webhook error:', err);
     await sendWhatsApp(phone, 'Ocurrió un error. Intenta de nuevo.');
