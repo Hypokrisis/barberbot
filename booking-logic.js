@@ -55,11 +55,6 @@ function displayDay(dateStr) {
   return days[new Date(dateStr + 'T12:00:00').getDay()];
 }
 
-const WEEKDAYS = {
-  'domingo': 0, 'lunes': 1, 'martes': 2, 'miércoles': 3, 'miercoles': 3,
-  'jueves': 4, 'viernes': 5, 'sábado': 6, 'sabado': 6,
-};
-
 // ¿La terna y-m-d corresponde a una fecha real del calendario? (sin rollover)
 function isRealDate(y, m, d) {
   if (!(m >= 1 && m <= 12 && d >= 1 && d <= 31)) return false;
@@ -73,29 +68,24 @@ function isInvalidDateToken(token) {
   return m ? !isRealDate(+m[1], +m[2], +m[3]) : false;
 }
 
-// "today" | "tomorrow" | día-semana-es | YYYY-MM-DD → YYYY-MM-DD (o null)
+// "today"/"hoy" | "tomorrow"/"mañana" | YYYY-MM-DD real → YYYY-MM-DD (o null).
+// PASO 2: ya NO resuelve días de la semana ni fechas lejanas — el bot por chat
+// solo maneja hoy y mañana; el resto se enruta al link.
 function resolveDateToken(token) {
   if (!token) return null;
   const t = String(token).trim().toLowerCase();
-  // YYYY-MM-DD: solo si es una fecha real (no "2026-06-32", que JS rodaría a julio).
   const ymd = /^(\d{4})-(\d{2})-(\d{2})$/.exec(t);
   if (ymd) return isRealDate(+ymd[1], +ymd[2], +ymd[3]) ? t : null;
-  const todayStr = todayPR();
-  const base = new Date(todayStr + 'T12:00:00');
-  if (t === 'today' || t === 'hoy') return todayStr;
-  if (t === 'tomorrow' || t === 'mañana' || t === 'manana') {
-    base.setDate(base.getDate() + 1);
-    return base.toISOString().split('T')[0];
-  }
-  if (t in WEEKDAYS) {
-    const target = WEEKDAYS[t];
-    for (let i = 1; i <= 7; i++) {
-      const d = new Date(todayStr + 'T12:00:00');
-      d.setDate(base.getDate() + i);
-      if (d.getDay() === target) return d.toISOString().split('T')[0];
-    }
-  }
+  if (t === 'today' || t === 'hoy') return todayPR();
+  if (t === 'tomorrow' || t === 'mañana' || t === 'manana') return tomorrowStr();
   return null;
+}
+// hoy/mañana SOLAMENTE → su fecha; cualquier otra cosa (día de semana, otro mes,
+// pasado mañana, fecha inexistente, lejana) → null. Es el filtro central del PASO 2.
+function resolveHoyMañana(token) {
+  const rd = resolveDateToken(token);
+  if (!rd) return null;
+  return (rd === todayPR() || rd === tomorrowStr()) ? rd : null;
 }
 
 function normalizeTime(t) {
@@ -112,12 +102,14 @@ function addDuration(time, dur) {
   return `${String(Math.floor(e / 60)).padStart(2, '0')}:${String(e % 60).padStart(2, '0')}`;
 }
 
-function daysFromToday(dateStr) {
-  return Math.round((new Date(dateStr + 'T12:00:00') - new Date(todayPR() + 'T12:00:00')) / 86400000);
-}
-function limitDateStr() {
-  const d = new Date(todayPR() + 'T12:00:00'); d.setDate(d.getDate() + 30);
+function tomorrowStr() {
+  const d = new Date(todayPR() + 'T12:00:00'); d.setDate(d.getDate() + 1);
   return d.toISOString().split('T')[0];
+}
+// Minutos transcurridos del día en hora de PR (para filtrar horas pasadas de hoy).
+function nowMinPR() {
+  const n = new Date(Date.now() - 4 * 60 * 60 * 1000);
+  return n.getUTCHours() * 60 + n.getUTCMinutes();
 }
 
 // ── Matching servicio / barbero ───────────────────────────────────────────────
@@ -160,16 +152,6 @@ function spreadSlots(slots, n = 4) {
   for (let i = 0; i < n; i++) out.push(slots[Math.round(i * step)]);
   return [...new Set(out)];
 }
-function nearestSlots(slots, time, n = 2) {
-  const target = toMin(time);
-  return slots
-    .map(s => ({ s, d: Math.abs(toMin(s) - target) }))
-    .sort((a, b) => a.d - b.d)
-    .slice(0, n)
-    .map(x => x.s)
-    .sort((a, b) => toMin(a) - toMin(b));
-}
-
 function joinNatural(arr, conj = 'y') {
   if (arr.length === 0) return '';
   if (arr.length === 1) return arr[0];
@@ -264,8 +246,8 @@ async function respond({ session, msg, understood, ctx, deps }) {
     if (!bk.name && history && history.name) bk.name = titleCase(history.name);
     if (understood.service) { const s = matchService(understood.service, services); if (s) setService(bk, s); }
     if (understood.barber)  { const b = matchBarber(understood.barber, barbers);   if (b) setBarber(bk, b); }
-    const wd = resolveDateToken(understood.date); if (wd) bk.wantDate = wd;
-    const wt = normalizeTime(understood.time);    if (wt) { bk.wantTime = wt; bk.wantTimeAmbiguous = !!understood.ampm_ambiguous; }
+    const wd = resolveHoyMañana(understood.date); if (wd) bk.wantDate = wd;
+    const wt = normalizeTime(understood.time);    if (wt) bk.wantTime = wt;
     return bk;
   }
 
@@ -277,7 +259,7 @@ async function respond({ session, msg, understood, ctx, deps }) {
   function welcomeText() {
     // CASO C — cliente nuevo
     return `¡Bienvenido a *${ctx.business.name}*! 💈\n` +
-           `Para tu cita dime:\n- Tu nombre\n- El servicio que quieres\n- El barbero que prefieres\n- El día y hora aproximada\n\n` +
+           `Para tu cita dime:\n- Tu nombre\n- El servicio que quieres\n- El barbero que prefieres\n- El día (hoy o mañana) y la hora\n\n` +
            `✂️ *Servicios:*\n${svcListText()}\n\n` +
            `💈 *Equipo:*\n${barberListText()}\n\n` +
            `${capabilitiesText()}\n\n` +
@@ -292,41 +274,50 @@ async function respond({ session, msg, understood, ctx, deps }) {
            `📅 O reserva: ${linkOnce()}`;
   }
   function activeApptText(a) {
-    // CASO A — cliente con cita activa
+    // CASO A — cliente con cita activa: SIEMPRE la cita + reagendar/cancelar (nada más).
     const sv = services.find(s => s.id === a.service_id);
     const ba = barbers.find(b => b.id === a.barber_id);
     return `¡Hola de nuevo, ${history.name}! 👋\nTienes una cita activa:\n` +
            `✂️ ${sv ? sv.name : 'tu servicio'} con ${ba ? ba.name : 'tu barbero'}\n` +
            `📅 ${formatDate(a.appointment_date)} a las ${formatTime(a.start_time)}\n\n` +
-           `¿Qué necesitas?\n🔄 Reagendar\n❌ Cancelar\n📅 Nueva cita\n❓ Preguntar algo`;
+           `¿Quieres 🔄 *reagendar* o ❌ *cancelar*?`;
   }
 
-  // Construye y muestra disponibilidad. Mueve a picking_slot / rescheduling.
-  // Máx 3 días hacia adelante × hasta 3 horarios por día. Solo cupos reales.
-  // `lead` opcional: frase introductoria (ej "Ese día no abre 😕").
-  async function offerSlots(forReschedule, lead) {
+  // PASO 2 — Mensaje ÚNICO de salida al link y FIN de la sesión de booking. Se usa
+  // para: fecha que no es hoy/mañana, hora fuera de la lista, o sin cupos.
+  function linkEnd() {
+    resetData();
+    return out(`Para esa fecha, mira la disponibilidad y reserva aquí 😊: ${bookingLink}`, 'idle', { reminder: false });
+  }
+  // ¿El cliente mencionó una fecha que NO es hoy ni mañana? (día de semana, otro
+  // mes, "pasado mañana", fecha inexistente, etc.)
+  function otherDateMentioned() {
+    return !!(understood.date && !resolveHoyMañana(understood.date));
+  }
+
+  // Muestra los horarios REALES de los días dados (hoy y/o mañana), numerados de
+  // corrido. Hoy filtra las horas ya pasadas. Sin cupos en ningún día → link.
+  async function offerDays(days, forReschedule, lead) {
     const bk = d.bk;
-    const nextState = forReschedule ? 'rescheduling' : 'picking_slot';
-    const head = lead ? `${lead}\n\n` : '';
-    if (!bk || !bk.barberId) {
-      return out(`Para ver horarios dime con qué barbero 🙂`, 'collecting');
-    }
-    const up = await deps.getUpcoming(bk.barberId, 3, 3); // hasta 3 días × 3 = 9
-    if (!up || !up.length) {
-      return out(`${head}${bk.barberName} no tiene espacios próximos 😕\n📅 Reserva en el calendario: ${linkOnce()}`, nextState);
-    }
+    if (!bk || !bk.barberId) return out(`Para ver horarios dime con qué barbero 🙂`, 'collecting');
+    const tStr = todayPR();
+    const nm = nowMinPR();
     d.offered = [];
     const blocks = [];
-    up.forEach((g) => {
-      for (const t of g.slots) d.offered.push({ date: g.date, time: t });
-      blocks.push(`${displayDay(g.date).toUpperCase()} — ${g.slots.map(formatTime).join(', ')}`);
-    });
-    d.negotiation = 0;
+    let n = 0;
+    for (const day of days) {
+      const av = await deps.getDayAvailability(bk.barberId, day);
+      let slots = (av && av.available) || [];
+      if (day === tStr) slots = slots.filter(s => toMin(s) > nm + 15);
+      if (!slots.length) continue;
+      const lines = slots.map(s => { d.offered.push({ date: day, time: s }); return `${++n}. ${formatTime(s)}`; });
+      blocks.push(`*${displayDay(day).toUpperCase()}*\n${lines.join('\n')}`);
+    }
+    if (!d.offered.length) return linkEnd();
+    const head = lead ? `${lead}\n\n` : '';
     return out(
-      `${head}📅 *${bk.barberName}* tiene espacio:\n${blocks.join('\n')}\n\n` +
-      `¿Cuál te queda bien?\nSi quieres otra hora, dímela y te verifico 😊\n` +
-      `📅 O elige aquí: ${linkOnce()}`,
-      nextState
+      `${head}📅 *${bk.barberName}* — elige tu horario:\n${blocks.join('\n\n')}\n\n(responde el número o la hora)`,
+      forReschedule ? 'rescheduling' : 'picking_slot'
     );
   }
 
@@ -343,165 +334,42 @@ async function respond({ session, msg, understood, ctx, deps }) {
     );
   }
 
-  // AM/PM genuinamente ambiguo → ofrecer las dos interpretaciones como opciones
-  // y dejar que el cliente elija. NUNCA asumir (decisión del usuario).
-  function ampmAsk(date, forReschedule) {
-    const t = normalizeTime(understood.time);
-    const [h, m] = t.split(':').map(Number);
-    const base = h % 12;
-    const amT = `${String(base).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
-    const pmT = `${String(base + 12).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
-    d.offered = [{ date, time: amT }, { date, time: pmT }];
-    d.negotiation = 0;
-    return out(`¿Te refieres a las ${formatTime(amT)} o las ${formatTime(pmT)}? 🙂`,
-      forReschedule ? 'rescheduling' : 'picking_slot', { reminder: false });
-  }
-
-  // CHOKEPOINT (Punto 4): toda hora puntual se verifica contra la DB aquí antes
-  // de confirmar. checkSlot distingue ocupada / fuera de horario / cerrado / pasada.
+  // CHOKEPOINT: verifica la hora puntual contra la DB. Solo hoy/mañana llegan aquí.
+  // Disponible → confirmar. Cualquier otra cosa (ocupada/fuera de horario/pasada)
+  // → link y fin, SIN negociar (PASO 2 simplificado).
   async function confirmSlot(date, time, forReschedule) {
-    const bk = d.bk;
-    const nextState = forReschedule ? 'rescheduling' : 'picking_slot';
-    if (daysFromToday(date) > 30) {
-      return out(`Solo puedo agendar hasta el *${formatDate(limitDateStr())}* 😊 ¿Qué otra fecha te sirve?`, nextState);
-    }
-    const chk = await deps.checkSlot(bk.barberId, date, time);
+    const chk = await deps.checkSlot(d.bk.barberId, date, time);
     if (chk.status === 'available') return await commitChosen({ date, time }, forReschedule);
-
-    // No disponible: NO se confirma nada (Punto 3). Se ofrece y el cliente re-elige.
-    d.negotiation = (d.negotiation || 0) + 1;
-    if (d.negotiation > 2) {
-      resetData();
-      return out(`No logramos cuadrar la hora 😕 Mejor elige directo en el calendario: ${linkOnce()}`, 'idle');
-    }
-    const within = chk.available || [];
-    const near = within.length ? nearestSlots(within, time, 2) : [];
-
-    // Sin cupos ese día (cerrado / pasada / vacío) → mostrar próximos días reales.
-    if (chk.status === 'closed' || chk.status === 'past' || within.length === 0) {
-      const lead = chk.status === 'closed' ? `Ese día ${bk.barberName} no abre 😕`
-                 : chk.status === 'past'   ? `Esa hora ya pasó ⌛`
-                 : `No me quedan espacios ese día 😕`;
-      return await offerSlots(forReschedule, lead);
-    }
-    // Hay cupos ese día → ofrecer los más cercanos, con el motivo correcto.
-    d.offered = near.map(x => ({ date, time: x }));
-    let lead;
-    if (chk.status === 'outside_hours') {
-      lead = `${bk.barberName} trabaja ese día de ${formatTime(chk.open)} a ${formatTime(chk.close)} 😊`;
-    } else if (chk.status === 'booked') {
-      lead = `Las ${formatTime(time)} está ocupada 😕`;
-    } else { // unaligned (dentro de horario pero no cae en slot de 30 min)
-      lead = `No tengo exactamente las ${formatTime(time)} 😕`;
-    }
-    return out(`${lead} Tengo ${joinNatural(near.map(formatTime), 'o')}, ¿cuál te sirve?`, nextState);
+    return linkEnd();
   }
 
-  // Interpreta la elección de horario (compartido entre picking_slot y rescheduling)
+  // Interpreta la elección de horario (picking_slot y rescheduling). Solo hoy/mañana:
+  // número de la lista, hora mostrada, o "hoy"/"mañana". Otra fecha u hora fuera de
+  // la lista → link y fin. Nada que reconocer → re-muestra hoy y mañana.
   async function pickSlot(forReschedule) {
-    const bk = d.bk;
     const offered = d.offered || [];
-
-    // Día por defecto para "hora sin día": el PRIMER día disponible mostrado; si
-    // no hay lista, el primer día próximo con cupo. NUNCA "hoy" a ciegas (BUG 1:
-    // "1pm" durante reagendar caía en hoy → "esa hora ya pasó").
-    async function defaultDate() {
-      if (offered[0] && offered[0].date) return offered[0].date;
-      const up = await deps.getUpcoming(bk.barberId, 1, 1);
-      return (up[0] && up[0].date) || todayPR();
-    }
-
-    // FIX 1: día objetivo cuando el cliente dio una HORA. Si Groq trajo un día
-    // resoluble (ya en YYYY-MM-DD), ese manda. Si NO, NUNCA asumimos a ciegas:
-    //  1) si todo lo ofrecido es de un mismo día → ese es el día en contexto;
-    //  2) si el barbero solo tiene UN día próximo con cupo real → ese;
-    //  3) varios días posibles → null (hay que preguntar cuál).
-    async function resolveTargetDate() {
-      const fromToken = resolveDateToken(understood.date);
-      if (fromToken) return fromToken;
-      const offDates = [...new Set(offered.map(o => o.date).filter(Boolean))];
-      if (offDates.length === 1) return offDates[0];
-      const up = await deps.getUpcoming(bk.barberId, 3, 3);
-      const days = (up || []).filter(g => g.slots && g.slots.length);
-      if (days.length === 1) return days[0].date;
-      return null;
-    }
-
-    // FIX 1: pregunta "¿para qué día?" con los días REALES del barbero (no asume).
-    // Cada opción guarda la MISMA hora pedida, así "2" o el nombre del día confirman.
-    async function askWhichDay(time) {
-      const up = await deps.getUpcoming(bk.barberId, 3, 3);
-      const days = (up || []).filter(g => g.slots && g.slots.length);
-      if (!days.length) return await offerSlots(forReschedule);
-      if (days.length === 1) return await confirmSlot(days[0].date, time, forReschedule);
-      d.offered = days.map(g => ({ date: g.date, time }));
-      d.negotiation = 0;
-      const opts = days.map((g, i) => `${i + 1}. ${displayDay(g.date)}`).join('\n');
-      return out(
-        `¿Para qué día las ${formatTime(time)}? 😊\n${opts}\n(responde el número o el día)`,
-        forReschedule ? 'rescheduling' : 'picking_slot'
-      );
-    }
-
-    // FIX 1: respuesta a "¿para qué día?" — lo ofrecido son VARIOS días con una
-    // misma hora y el cliente da un día → confirmar esa hora en el día elegido.
-    {
-      const offDates = [...new Set(offered.map(o => o.date))];
-      const offTimes = [...new Set(offered.map(o => o.time))];
-      if (understood.date && !understood.time && offDates.length > 1 && offTimes.length === 1) {
-        const dt = resolveDateToken(understood.date);
-        const hit = dt && offered.find(o => o.date === dt);
-        if (hit) return await confirmSlot(hit.date, hit.time, forReschedule);
-      }
-    }
-
-    // 0. AM/PM ambiguo → preguntar una vez (sin asumir).
-    if (understood.time && understood.ampm_ambiguous) {
-      const date = resolveDateToken(understood.date) || await defaultDate();
-      return ampmAsk(date, forReschedule);
-    }
-    // 1. Elección por posición ("1", "el primero") — re-verifica vs DB (Punto 4).
+    // Otra fecha (no hoy/mañana) → link y fin.
+    if (otherDateMentioned()) return linkEnd();
+    // 1. Elección por número de la lista mostrada.
     if (choiceNum && choiceNum >= 1 && choiceNum <= offered.length) {
       const sel = offered[choiceNum - 1];
       return await confirmSlot(sel.date, sel.time, forReschedule);
     }
-    // 2. Hora explícita → verificar vs DB. El día: el que dijo el cliente; si no
-    //    dio día resoluble, resolveTargetDate decide sin asumir a ciegas (FIX 1).
-    //    Si hay varios días posibles → preguntamos cuál en vez de elegir el primero.
+    // 2. Día hoy/mañana mencionado.
+    if (understood.date) {
+      const rd = resolveHoyMañana(understood.date); // hoy o mañana (otherDate ya filtró)
+      if (understood.time) return await confirmSlot(rd, normalizeTime(understood.time), forReschedule);
+      return await offerDays([rd], forReschedule);
+    }
+    // 3. Hora exacta sin día → debe estar en la lista mostrada (prioriza hoy).
     if (understood.time) {
       const t = normalizeTime(understood.time);
-      const targetDate = await resolveTargetDate();
-      if (!targetDate) return await askWhichDay(t);
-      return await confirmSlot(targetDate, t, forReschedule);
+      const match = offered.find(o => o.time === t);
+      if (match) return await confirmSlot(match.date, match.time, forReschedule);
+      return linkEnd(); // hora que no está en la lista de hoy/mañana → link
     }
-    // 3. Día específico → lista NUMERADA con TODOS los cupos de ese día (BUG 3).
-    if (understood.date) {
-      const targetDate = resolveDateToken(understood.date);
-      if (targetDate && daysFromToday(targetDate) > 30) {
-        return out(`Solo puedo agendar hasta el *${formatDate(limitDateStr())}* 😊 ¿Qué otra fecha te sirve?`);
-      }
-      const day = targetDate ? await deps.getDayAvailability(bk.barberId, targetDate) : null;
-      if (day && !day.closed && day.available.length) {
-        d.offered = day.available.map(t => ({ date: targetDate, time: t }));
-        const lines = day.available.map((t, i) => `${i + 1}. ${formatTime(t)}`).join('\n');
-        return out(
-          `📅 *${bk.barberName}* el ${formatDate(targetDate).toLowerCase()}:\n${lines}\n\n` +
-          `¿Cuál prefieres? (responde el número o la hora)`,
-          forReschedule ? 'rescheduling' : 'picking_slot'
-        );
-      }
-      d.negotiation = (d.negotiation || 0) + 1;
-      if (d.negotiation > 2) { resetData(); return out(`Mejor elige en el calendario: ${linkOnce()}`, 'idle'); }
-      return await offerSlots(forReschedule, day && day.closed ? `Ese día ${bk.barberName} no abre 😕` : null);
-    }
-    // 4. Sin hora/día/elección (ej "qué horarios tienes"):
-    //    - Si YA le mostramos horarios → NO repetir el bloque (regla irrompible
-    //      "nunca repetir el mismo mensaje"); pedir un día/hora específico.
-    //    - Si aún no hay nada mostrado → mostrar los próximos días del barbero.
-    if (offered.length) {
-      return out(`Ya te mostré los horarios disponibles 🙂\n¿Hay algún día o hora específica que prefieras?`);
-    }
-    return await offerSlots(forReschedule);
+    // 4. "horarios" / nada reconocido → mostrar hoy y mañana.
+    return await offerDays([todayPR(), tomorrowStr()], forReschedule);
   }
 
   // Red de seguridad determinista: Groq (llama-3.1-8b) a veces NO extrae un
@@ -520,8 +388,11 @@ async function respond({ session, msg, understood, ctx, deps }) {
     }
   }
 
-  // Pide lo que falte (nombre/servicio/barbero) o pasa a ofrecer horarios.
+  // Pide lo que falte (nombre/servicio/barbero) o pasa a ofrecer horarios hoy/mañana.
   async function advanceCollecting() {
+    // PASO 2: si mencionó una fecha que no es hoy/mañana → link y fin (aunque falten datos).
+    if (otherDateMentioned()) return linkEnd();
+
     const bk = d.bk || (d.bk = {});
     if (!bk.barberId && barbers.length === 1) setBarber(bk, barbers[0]);
     recoverSingleWord(bk);
@@ -539,19 +410,23 @@ async function respond({ session, msg, understood, ctx, deps }) {
       return out(`Me falta ${joinNatural(missing)} 🙂${extra}`, 'collecting');
     }
 
-    // Todo recolectado. ¿Pidió día+hora concretos? Verificar SIEMPRE contra la DB.
+    // Todo recolectado. ¿Pidió día (hoy/mañana) + hora? → verificar vs DB y confirmar.
     if (bk.wantDate && bk.wantTime) {
-      const wd = bk.wantDate, wt = bk.wantTime, amb = bk.wantTimeAmbiguous;
-      bk.wantDate = null; bk.wantTime = null; bk.wantTimeAmbiguous = false;
-      if (amb) return ampmAsk(wd, false);          // AM/PM ambiguo → preguntar una vez
-      return await confirmSlot(wd, wt, false);     // chokepoint: verifica vs DB
+      const wd = bk.wantDate, wt = bk.wantTime;
+      bk.wantDate = null; bk.wantTime = null;
+      return await confirmSlot(wd, wt, false);
     }
-    return await offerSlots(false);
+    // ¿Solo día (hoy/mañana)? → ese día. Si no especificó → hoy y mañana juntos.
+    if (bk.wantDate) {
+      const wd = bk.wantDate; bk.wantDate = null;
+      return await offerDays([wd], false);
+    }
+    return await offerDays([todayPR(), tomorrowStr()], false);
   }
 
   // ── Acciones sobre la cita existente ────────────────────────────────────────
   // REAGENDAR: 1) muestra la cita y pregunta si la cambiamos, 2) al confirmar →
-  // muestra horarios (offerSlots). El UPDATE ocurre tras elegir + confirmar.
+  // muestra horarios de hoy/mañana (offerDays). El UPDATE ocurre tras elegir + confirmar.
   async function startReschedule() {
     const appts = await deps.getActiveAppointments();
     if (!appts.length) {
@@ -617,7 +492,7 @@ async function respond({ session, msg, understood, ctx, deps }) {
     if (action === 'reschedule_start') affirm = affirm || I === 'REAGENDAR';
 
     if (affirm) {
-      if (action === 'reschedule_start') return await offerSlots(true); // → horarios
+      if (action === 'reschedule_start') return await offerDays([todayPR(), tomorrowStr()], true); // → horarios hoy/mañana
       if (action === 'create') {
         const bk = d.bk;
         // FIX 4 — REGLA #1 defendida en el chokepoint: si apareció una cita activa
@@ -637,12 +512,12 @@ async function respond({ session, msg, understood, ctx, deps }) {
         if (!r.ok && r.reason === 'taken') {
           const takenTime = bk.time;
           d.pendingAction = null;
-          return await offerSlots(false, `Uy, alguien acaba de tomar las ${formatTime(takenTime)} 😕`);
+          return await offerDays([todayPR(), tomorrowStr()], false, `Uy, alguien acaba de tomar las ${formatTime(takenTime)} 😕`);
         }
         const { name, date, time } = bk;
         resetData();
         if (!r.ok) return out(`Uy, no pude guardar la cita 😕 Intenta de nuevo en un momento.`, 'idle');
-        return out(`✅ ¡Listo, ${name}! Te esperamos el ${formatDate(date)} a las ${formatTime(time)} 💈`, 'idle');
+        return out(`✅ ¡Listo, ${name}! Te esperamos el ${formatDate(date)} a las ${formatTime(time)} 💈\n\nSi necesitas algo: 🔄 Reagendar · ❌ Cancelar`, 'idle');
       }
       if (action === 'reschedule') {
         const bk = d.bk;
@@ -654,12 +529,12 @@ async function respond({ session, msg, understood, ctx, deps }) {
         if (!r.ok && r.reason === 'taken') {
           const takenTime = bk.time;
           d.pendingAction = null;
-          return await offerSlots(true, `Uy, alguien acaba de tomar las ${formatTime(takenTime)} 😕`);
+          return await offerDays([todayPR(), tomorrowStr()], true, `Uy, alguien acaba de tomar las ${formatTime(takenTime)} 😕`);
         }
         const { name, date, time } = bk;
         resetData();
         if (!r.ok) return out(`Hubo un error al reagendar 😕 Intenta de nuevo en un momento.`, 'idle');
-        return out(`✅ ¡Listo, ${name}! Te esperamos el ${formatDate(date)} a las ${formatTime(time)} 💈`, 'idle');
+        return out(`✅ ¡Listo, ${name}! Te esperamos el ${formatDate(date)} a las ${formatTime(time)} 💈\n\nSi necesitas algo: 🔄 Reagendar · ❌ Cancelar`, 'idle');
       }
       if (action === 'cancel') {
         const r = await deps.commitCancel(d.cancelApptId);
@@ -675,12 +550,12 @@ async function respond({ session, msg, understood, ctx, deps }) {
       resetData();
       return out(`¡Perfecto, te esperamos! 💈`, 'idle');
     }
-    // FIX 2: corrección de día/hora durante la confirmación de un horario. Si el
-    // cliente menciona un día o una hora DISTINTOS a los que se confirman, es una
-    // corrección (no un sí/no): re-verificamos contra el horario real del barbero
-    // ese día y volvemos a confirmar. (No aplica a cancelar.)
+    // Corrección de día/hora durante la confirmación. Si menciona un día/hora
+    // DISTINTO es una corrección (no un sí/no): re-verifica contra la DB. Misma
+    // regla hoy/mañana — otra fecha → link.
     if ((action === 'reschedule' || action === 'create') && d.bk && (understood.date || understood.time)) {
-      const newDate = resolveDateToken(understood.date) || d.bk.date;
+      if (otherDateMentioned()) return linkEnd();
+      const newDate = (understood.date ? resolveHoyMañana(understood.date) : null) || d.bk.date;
       const newTime = normalizeTime(understood.time) || d.bk.time;
       if (newDate !== d.bk.date || newTime !== d.bk.time) {
         d.pendingAction = null;
@@ -701,12 +576,6 @@ async function respond({ session, msg, understood, ctx, deps }) {
 
   // ── Guardas previas al ruteo por estado (confirming ya retornó arriba) ───────
   const hasData = !!(understood.service || understood.name || understood.barber || understood.time || understood.date);
-
-  // BUG 3 — Fecha inexistente (ej "32 de junio" → 2026-06-32, que JS rodaría a
-  // julio en silencio). No la aceptamos; pedimos de nuevo sin perder el estado.
-  if (isInvalidDateToken(understood.date)) {
-    return out(`Esa fecha no existe 😅 ¿qué día quieres decir?`);
-  }
 
   // BUG 1 — "tengo preguntas/dudas" sin una pregunta concreta todavía → invitar
   // a preguntar y ESPERAR, en vez de empujar el flujo de datos (servicio/barbero).
@@ -741,24 +610,10 @@ async function respond({ session, msg, understood, ctx, deps }) {
     }
 
     // ── CASO A: cliente con cita activa ──────────────────────────────────────
+    // SIMPLIFICACIÓN: cualquier mensaje (que no haya sido REAGENDAR/CANCELAR, ya
+    // capturados como intents globales arriba) → SIEMPRE muestra la cita y pregunta
+    // reagendar/cancelar. Sin nueva cita, sin preguntas generales, sin otras ramas.
     if (active) {
-      // Acuse del recordatorio ("confirmo" sobre una cita ya existente)
-      if (I === 'CONFIRMAR') {
-        return out(`✅ ¡Perfecto! Te esperamos a las ${formatTime(active.start_time)} 💈`);
-      }
-      // BUG 5 — Pregunta general REAL va PRIMERO, ANTES que hasData: aunque Groq
-      // extrajo por error un día/hora de "¿hasta qué hora abren los sábados?", si
-      // la intención es PREGUNTA_GENERAL SIEMPRE se responde (nunca el bloqueo de
-      // "una cita activa"). Un saludo pelado no es pregunta → cae al mensaje limpio.
-      if (I === 'PREGUNTA_GENERAL' && !isGreeting(msg)) {
-        const ans = await deps.askGeneral(msg);
-        return out(`${ans}\n\n¿Algo más con tu cita? (reagendar / cancelar)`);
-      }
-      // REGLA #1: pide nueva cita o manda datos de reserva → no se crea otra.
-      if (I === 'NUEVA_CITA' || hasData) {
-        return out(`Solo puedes tener una cita activa a la vez 😊 ¿Quieres *cambiar* la que tienes o *cancelarla* primero?`);
-      }
-      // Saludo / cualquier otra cosa → mostrar la cita y las opciones (ya trae menú).
       return out(activeApptText(active), undefined, { reminder: false });
     }
 
@@ -813,7 +668,7 @@ async function respond({ session, msg, understood, ctx, deps }) {
 module.exports = {
   respond,
   // helpers expuestos para tests / index.js
-  todayPR, formatDate, formatTime, shortDate, displayDay, resolveDateToken, normalizeTime,
-  addDuration, matchService, matchBarber, matchStrict, spreadSlots, nearestSlots, joinNatural, titleCase,
+  todayPR, tomorrowStr, formatDate, formatTime, shortDate, displayDay, resolveDateToken, resolveHoyMañana, normalizeTime,
+  addDuration, matchService, matchBarber, matchStrict, spreadSlots, joinNatural, titleCase,
   isGreeting, wantsToAsk, isInvalidDateToken, isRealDate,
 };
