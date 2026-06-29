@@ -289,13 +289,28 @@ function normalizePhone(phone) {
   return phone.replace(/\D/g, '');
 }
 
+// Normaliza a E.164 para usarlo como identidad universal del cliente.
+// 10 dígitos -> +1XXXXXXXXXX | 11 empezando en 1 -> +1XXXXXXXXXX | otro -> tal cual.
+function normalizePhoneE164(phone) {
+  if (!phone) return phone;
+  const digits = phone.replace(/\D/g, '');
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
+  return phone;
+}
+
 // Busca si el teléfono corresponde a un usuario registrado en Spacey
 async function findRegisteredUser(phone) {
   const normalized = normalizePhone(phone);
+  // Pre-filtro barato por los últimos 4 dígitos (contiguos en cualquier formato:
+  // "939 316 7853", "(939) 316-7853", etc.) para no bajar toda la tabla profiles.
+  // El match real se valida en JS abajo. No tiene que ser perfecto, solo reduce el scan.
+  const last4 = normalized.slice(-4);
   const { data: profiles } = await supabase
     .from('profiles')
     .select('id, full_name, phone')
-    .not('phone', 'is', null);
+    .not('phone', 'is', null)
+    .ilike('phone', `%${last4}%`);
 
   if (!profiles) return null;
   return profiles.find(p => normalizePhone(p.phone || '') === normalized) || null;
@@ -310,11 +325,13 @@ async function createAppointment(data) {
     barber_id: data.barberId,
     service_id: data.serviceId,
     customer_name: data.customerName,
-    customer_phone: data.customerPhone,
+    customer_phone: normalizePhoneE164(data.customerPhone),
     appointment_date: data.date,
     start_time: data.startTime,
     end_time: data.endTime,
     status: 'confirmed',
+    // Sin cuenta vinculada => invitado. Se persiste (antes solo se calculaba).
+    is_guest: !registeredUser,
   };
 
   // Si el usuario tiene cuenta, vincular la cita a su perfil
