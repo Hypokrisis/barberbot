@@ -19,6 +19,11 @@
 // REGLA IRROMPIBLE #1: un número = una cita activa máximo. Si tiene cita activa
 // y pide una nueva → se le ofrece reagendar o cancelar primero (NUNCA se crea otra).
 
+// URL del frontend (panel web). Configurable por env; cae al dominio de producción.
+// Se usa solo para el CTA de "crea tu cuenta" — el bot sigue identificando al
+// cliente por su número de WhatsApp, con cuenta o sin ella.
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://spaceyreserve.netlify.app';
+
 // ── Helpers de fecha/hora (PR = UTC-4, sin DST) ───────────────────────────────
 function todayPR() {
   return new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString().split('T')[0];
@@ -517,7 +522,7 @@ async function respond({ session, msg, understood, ctx, deps }) {
         const { name, date, time } = bk;
         resetData();
         if (!r.ok) return out(`Uy, no pude guardar la cita 😕 Intenta de nuevo en un momento.`, 'idle');
-        return out(`✅ ¡Listo, ${name}! Te esperamos el ${formatDate(date)} a las ${formatTime(time)} 💈\n\nSi necesitas algo: 🔄 Reagendar · ❌ Cancelar`, 'idle');
+        return out(`✅ ¡Listo, ${name}! Te esperamos el ${formatDate(date)} a las ${formatTime(time)} 💈\n\nSi necesitas algo: 🔄 Reagendar · ❌ Cancelar\n\n📋 Crea tu cuenta para ver y gestionar tus citas: ${FRONTEND_URL}/register-client`, 'idle');
       }
       if (action === 'reschedule') {
         const bk = d.bk;
@@ -534,7 +539,7 @@ async function respond({ session, msg, understood, ctx, deps }) {
         const { name, date, time } = bk;
         resetData();
         if (!r.ok) return out(`Hubo un error al reagendar 😕 Intenta de nuevo en un momento.`, 'idle');
-        return out(`✅ ¡Listo, ${name}! Te esperamos el ${formatDate(date)} a las ${formatTime(time)} 💈\n\nSi necesitas algo: 🔄 Reagendar · ❌ Cancelar`, 'idle');
+        return out(`✅ ¡Listo, ${name}! Te esperamos el ${formatDate(date)} a las ${formatTime(time)} 💈\n\nSi necesitas algo: 🔄 Reagendar · ❌ Cancelar\n\n📋 Crea tu cuenta para ver y gestionar tus citas: ${FRONTEND_URL}/register-client`, 'idle');
       }
       if (action === 'cancel') {
         const r = await deps.commitCancel(d.cancelApptId);
