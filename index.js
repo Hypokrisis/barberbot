@@ -313,7 +313,10 @@ async function findRegisteredUser(phone) {
     .ilike('phone', `%${last4}%`);
 
   if (!profiles) return null;
-  return profiles.find(p => normalizePhone(p.phone || '') === normalized) || null;
+  // Comparar por los últimos 10 dígitos: el bot recibe +1XXXXXXXXXX (11 dígitos con
+  // el 1) y profiles guarda 10 dígitos sin el 1, así que comparar el string completo
+  // fallaba siempre. Los últimos 10 son la identidad real del número PR/USA.
+  return profiles.find(p => normalizePhone(p.phone || '').slice(-10) === normalized.slice(-10)) || null;
 }
 
 async function createAppointment(data) {
