@@ -116,6 +116,10 @@ function todayPR() {
   return prTime.toISOString().split('T')[0];
 }
 
+function nowTimePR() {
+  return new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString().split('T')[1].slice(0, 5);
+}
+
 function formatDate(dateStr) {
   const months = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto',
                   'septiembre','octubre','noviembre','diciembre'];
@@ -358,7 +362,11 @@ async function getAllActiveAppointments(phone, businessId) {
     .eq('status', 'confirmed')
     .gte('appointment_date', todayStr)
     .order('appointment_date', { ascending: true });
-  return data || [];
+  const nowTime = nowTimePR();
+  return (data || []).filter(a =>
+    a.appointment_date > todayStr ||
+    a.start_time.slice(0, 5) >= nowTime
+  );
 }
 
 // PASO 0 del flujo: el número de WhatsApp es el identificador universal.
@@ -376,8 +384,12 @@ async function getClientHistory(phone, businessId) {
   if (!data || !data.length) return { hasHistory: false };
 
   const name = data.find(a => a.customer_name)?.customer_name || null;
+  const nowTime = nowTimePR();
   const activeAppointment = data
-    .filter(a => a.status === 'confirmed' && a.appointment_date >= todayStr)
+    .filter(a => a.status === 'confirmed' && (
+      a.appointment_date > todayStr ||
+      (a.appointment_date === todayStr && a.start_time.slice(0, 5) >= nowTime)
+    ))
     .sort((a, b) => (a.appointment_date < b.appointment_date ? -1 : 1))[0] || null;
 
   return { hasHistory: true, name, activeAppointment };
