@@ -11,6 +11,8 @@ const cron = require('node-cron');
 const bookingLogic = require('./booking-logic');
 
 // ── Environment validation ───────────────────────────────────────────────────
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://spaceyreserve.netlify.app';
+
 const requiredEnvVars = [
   'SUPABASE_URL', 'SUPABASE_SERVICE_KEY',
   'TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_WHATSAPP_FROM',
@@ -155,8 +157,8 @@ function canSendReports(business) {
 // NUNCA debe apuntar a un negocio específico por defecto.
 function bookingLinkFor(business) {
   if (business && business.whatsapp_booking_link) return business.whatsapp_booking_link;
-  if (business && business.slug) return `https://spaceyreserve.netlify.app/book/${business.slug}`;
-  return 'https://spaceyreserve.netlify.app';
+  if (business && business.slug) return `${FRONTEND_URL}/book/${business.slug}`;
+  return FRONTEND_URL;
 }
 
 function canSendProactive(business) {
@@ -790,7 +792,7 @@ async function sendReminders() {
       const hora = formatTime(apt.start_time);
       const dia = formatDate(apt.appointment_date);
 
-      const link = apt.businesses?.slug ? `https://spaceyreserve.netlify.app/book/${apt.businesses.slug}` : '';
+      const link = apt.businesses?.slug ? `${FRONTEND_URL}/book/${apt.businesses.slug}` : '';
       const tmpl24 = process.env.TWILIO_TEMPLATE_REMINDER_24H;
       // Fallback de seguridad: texto libre si aún no hay plantilla configurada.
       const msg =
@@ -848,7 +850,7 @@ async function sendReminders() {
       const barberName = apt.barbers?.name || 'el barbero';
       const serviceName = apt.services?.name || 'tu servicio';
       const hora = formatTime(apt.start_time);
-      const link = apt.businesses?.slug ? `https://spaceyreserve.netlify.app/book/${apt.businesses.slug}` : '';
+      const link = apt.businesses?.slug ? `${FRONTEND_URL}/book/${apt.businesses.slug}` : '';
       const tmpl1h = process.env.TWILIO_TEMPLATE_REMINDER_1H;
       // Fallback de seguridad: texto libre si aún no hay plantilla configurada.
       const msg =
