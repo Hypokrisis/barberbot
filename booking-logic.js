@@ -340,11 +340,27 @@ async function respond({ session, msg, understood, ctx, deps }) {
   }
 
   // CHOKEPOINT: verifica la hora puntual contra la DB. Solo hoy/mañana llegan aquí.
-  // Disponible → confirmar. Cualquier otra cosa (ocupada/fuera de horario/pasada)
-  // → link y fin, SIN negociar (PASO 2 simplificado).
+  // Disponible → confirmar. Unaligned (p.ej. 2:15) → ofrecer las 2 más cercanas.
+  // Cualquier otra cosa → link y fin.
   async function confirmSlot(date, time, forReschedule) {
     const chk = await deps.checkSlot(d.bk.barberId, date, time);
     if (chk.status === 'available') return await commitChosen({ date, time }, forReschedule);
+    if (chk.status === 'unaligned') {
+      const nm   = date === todayPR() ? nowMinPR() : -1;
+      const tMin = toMin(time);
+      const candidates = (chk.available || [])
+        .filter(s => toMin(s) > nm + 15)
+        .sort((a, b) => Math.abs(toMin(a) - tMin) - Math.abs(toMin(b) - tMin))
+        .slice(0, 2);
+      if (candidates.length) {
+        d.offered = candidates.map(s => ({ date, time: s }));
+        const lines = candidates.map((s, i) => `${i + 1}. ${formatTime(s)}`).join('\n');
+        return out(
+          `Las ${formatTime(time)} no cae exacto 😊 Las más cercanas:\n${lines}\n\n(responde el número o la hora)`,
+          forReschedule ? 'rescheduling' : 'picking_slot'
+        );
+      }
+    }
     return linkEnd();
   }
 
@@ -366,12 +382,34 @@ async function respond({ session, msg, understood, ctx, deps }) {
       if (understood.time) return await confirmSlot(rd, normalizeTime(understood.time), forReschedule);
       return await offerDays([rd], forReschedule);
     }
-    // 3. Hora exacta sin día → debe estar en la lista mostrada (prioriza hoy).
+    // 3. Hora exacta sin día → si está en lista, confirmar; si no, verificar en DB.
     if (understood.time) {
       const t = normalizeTime(understood.time);
       const match = offered.find(o => o.time === t);
       if (match) return await confirmSlot(match.date, match.time, forReschedule);
-      return linkEnd(); // hora que no está en la lista de hoy/mañana → link
+      // No está en la lista ofrecida → verificar en hoy y mañana contra la DB.
+      // Si es 'available' → confirmar; si es 'unaligned' → ofrecer las más cercanas.
+      const tMin = toMin(t);
+      for (const day of [todayPR(), tomorrowStr()]) {
+        const chk = await deps.checkSlot(d.bk.barberId, day, t);
+        if (chk.status === 'available') return await confirmSlot(day, t, forReschedule);
+        if (chk.status === 'unaligned') {
+          const nm = day === todayPR() ? nowMinPR() : -1;
+          const candidates = (chk.available || [])
+            .filter(s => toMin(s) > nm + 15)
+            .sort((a, b) => Math.abs(toMin(a) - tMin) - Math.abs(toMin(b) - tMin))
+            .slice(0, 2);
+          if (candidates.length) {
+            d.offered = candidates.map(s => ({ date: day, time: s }));
+            const lines = candidates.map((s, i) => `${i + 1}. ${formatTime(s)}`).join('\n');
+            return out(
+              `Las ${formatTime(t)} no cae exacto 😊 Las más cercanas:\n${lines}\n\n(responde el número o la hora)`,
+              forReschedule ? 'rescheduling' : 'picking_slot'
+            );
+          }
+        }
+      }
+      return linkEnd();
     }
     // 4. "horarios" / nada reconocido → mostrar hoy y mañana.
     return await offerDays([todayPR(), tomorrowStr()], forReschedule);
