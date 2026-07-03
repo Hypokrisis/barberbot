@@ -574,10 +574,15 @@ async function respond({ session, msg, understood, ctx, deps }) {
           d.pendingAction = null;
           return await offerDays([todayPR(), tomorrowStr()], true, `Uy, alguien acaba de tomar las ${formatTime(takenTime)} 😕`);
         }
-        const { name, date, time } = bk;
+        const { name, date, time, serviceName, barberName } = bk;
         resetData();
         if (!r.ok) return out(`Hubo un error al reagendar 😕 Intenta de nuevo en un momento.`, 'idle');
-        return out(`✅ ¡Listo, ${name}! Te esperamos el ${formatDate(date)} a las ${formatTime(time)} 💈\n\nSi necesitas algo: 🔄 Reagendar · ❌ Cancelar\n\n📋 Crea tu cuenta para ver y gestionar tus citas: ${FRONTEND_URL}/register-client`, 'idle');
+        return out(
+          `🔄 ¡Listo! Tu cita fue reagendada:\n` +
+          `✂️ ${serviceName || 'tu servicio'} con ${barberName || 'tu barbero'}\n` +
+          `📅 ${formatDate(date)} a las ${formatTime(time)} 💈`,
+          'idle'
+        );
       }
       if (action === 'cancel') {
         const r = await deps.commitCancel(d.cancelApptId);
