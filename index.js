@@ -916,6 +916,17 @@ async function suppressBotTemplate(appointmentId, eventType) {
 
 async function handleMessage(phone, message, businessId) {
   const session = await getSession(phone, businessId);
+
+  // Expiración defensiva: si la sesión en memoria está activa pero lleva más de
+  // SESSION_TTL sin actualizarse (p.ej. el server se reinició y cargó del DB),
+  // la reseteamos a idle antes de procesar. getSession() ya lo hace al leer del DB,
+  // pero este check cierra la ventana si el objeto en-memoria quedó stale.
+  if (session.state !== 'idle' && session.lastActivity && Date.now() - session.lastActivity > SESSION_TTL) {
+    session.state = 'idle';
+    session.data  = {};
+    session.history = [];
+  }
+
   const { business, barbers, services } = await getBusinessInfo(businessId);
   const msg = message.trim();
   const bookingLink = bookingLinkFor(business);
