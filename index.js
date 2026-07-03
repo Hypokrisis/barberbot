@@ -1001,10 +1001,11 @@ async function handleMessage(phone, message, businessId) {
           .eq('id', apptId);
         if (error) {
           console.error('[commitReschedule]', error.code, error.message);
-          // 23505: el índice único rechazó el nuevo slot (otro cliente lo tomó en
-          // la carrera entre checkSlot y el UPDATE). Igual que en create: lo
-          // distinguimos para re-ofrecer horarios en vez de un error genérico.
-          if (error.code === '23505') return { ok: false, reason: 'taken' };
+          // Solo es "slot tomado" si la violación viene del índice de citas (uniq_appointment_slot).
+          // Un 23505 de notification_jobs (trigger interno) NO significa que el slot esté ocupado.
+          if (error.code === '23505' && error.message?.includes('uniq_appointment_slot')) {
+            return { ok: false, reason: 'taken' };
+          }
           return { ok: false };
         }
         await suppressBotTemplate(apptId, 'rescheduled');
