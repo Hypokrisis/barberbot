@@ -1010,7 +1010,14 @@ async function handleMessage(phone, message, businessId) {
       },
       commitReschedule: async (apptId, date, time, endTime) => {
         const { error } = await supabase.from('appointments')
-          .update({ appointment_date: date, start_time: time, end_time: endTime })
+          .update({
+            appointment_date:   date,
+            start_time:        time,
+            end_time:          endTime,
+            // Reset so reminders fire for the NEW time, not the old one
+            reminder_24h_sent: false,
+            reminder_30m_sent: false,
+          })
           .eq('id', apptId);
         if (error) {
           console.error('[commitReschedule]', error.code, error.message);
