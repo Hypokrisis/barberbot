@@ -516,6 +516,7 @@ async function askGroq(session, message, business, services) {
   };
   const tone = toneMap[business.whatsapp_bot_personality] || toneMap.quick;
   const ownerPrompt = (business.whatsapp_bot_prompt || '').trim();
+  const ownerFaq    = (business.whatsapp_bot_faq    || '').trim();
   const nowPR = new Date(Date.now() - 4 * 60 * 60 * 1000);
   const nowStrPR = `${String(nowPR.getUTCHours()).padStart(2,'0')}:${String(nowPR.getUTCMinutes()).padStart(2,'0')}`;
   const systemPrompt = `Eres el asistente de ${business.name} en ${business.city || 'Puerto Rico'}.
@@ -526,7 +527,7 @@ REGLAS ESTRICTAS:
 - Servicios disponibles: ${services.map(s => `${s.name} $${s.price}`).join(', ')}
 - No inventes información que no esté en los datos
 - Hora actual en Puerto Rico: ${nowStrPR}. Si preguntan por horarios de hoy, no menciones horas que ya pasaron.
-- ${tone}${ownerPrompt ? `\n- Instrucciones del dueño: ${ownerPrompt}` : ''}`;
+- ${tone}${ownerPrompt ? `\n- Instrucciones del dueño: ${ownerPrompt}` : ''}${ownerFaq ? `\n- Preguntas frecuentes:\n${ownerFaq}` : ''}`;
 
   session.history.push({ role: 'user', content: message });
   const completion = await groq.chat.completions.create({
