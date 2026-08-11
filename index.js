@@ -397,12 +397,12 @@ async function getClientHistory(phone, businessId) {
   return { hasHistory: true, name, activeAppointment };
 }
 
-async function sendWhatsApp(to, body) {
+async function sendWhatsApp(to, body, client = twilioClient, from = process.env.TWILIO_WHATSAPP_FROM) {
   // Log de SALIDA: cada respuesta del bot queda en los logs de Railway (regla de
   // oro). Así un fallo en vivo se diagnostica sin depender del CSV de Twilio.
   console.log(`[${to}] → ${body}`);
-  await twilioClient.messages.create({
-    from: process.env.TWILIO_WHATSAPP_FROM,
+  await client.messages.create({
+    from,
     to: `whatsapp:${to}`,
     body
   });
@@ -411,9 +411,9 @@ async function sendWhatsApp(to, body) {
 // Envía una plantilla aprobada de WhatsApp (necesaria para mensajes iniciados por
 // el negocio fuera de la ventana de 24h, como los recordatorios). `vars` mapea
 // las variables de la plantilla: { "1": ..., "2": ... }.
-async function sendTemplate(to, contentSid, vars) {
-  await twilioClient.messages.create({
-    from: process.env.TWILIO_WHATSAPP_FROM,
+async function sendTemplate(to, contentSid, vars, client = twilioClient, from = process.env.TWILIO_WHATSAPP_FROM) {
+  await client.messages.create({
+    from,
     to: `whatsapp:${to}`,
     contentSid,
     contentVariables: JSON.stringify(vars),
@@ -1111,7 +1111,7 @@ async function bumpUsage(businessId, direction, n = 1) {
 }
 
 // ── Twilio signature validator middleware ─────────────────────────────────────
-function validateTwilioSignature(req, res, next) {
+async function validateTwilioSignature(req, res, next) {
   // Skip validation in local dev if flag is set
   if (process.env.SKIP_TWILIO_VALIDATION === 'true') {
     console.warn('[WARN] Twilio signature validation SKIPPED (dev mode)');
@@ -1126,19 +1126,27 @@ function validateTwilioSignature(req, res, next) {
     return res.status(403).send('Forbidden');
   }
 
-  const isValid = twilio.validateRequest(
-    process.env.TWILIO_AUTH_TOKEN,
-    signature,
-    url,
-    req.body
-  );
-
-  if (!isValid) {
-    console.warn(`[SECURITY] Invalid Twilio signature from ${req.ip} — rejected`);
-    return res.status(403).send('Forbidden');
+  // Try platform token first (covers sandbox + businesses without own Twilio account)
+  if (twilio.validateRequest(process.env.TWILIO_AUTH_TOKEN, signature, url, req.body)) {
+    return next();
   }
 
-  next();
+  // Try per-business auth token for businesses with their own Twilio sub-account
+  const To = req.body?.To;
+  if (To) {
+    const { data: ts } = await supabase
+      .from('twilio_settings')
+      .select('auth_token')
+      .eq('whatsapp_from', To)
+      .eq('is_active', true)
+      .maybeSingle();
+    if (ts?.auth_token && twilio.validateRequest(ts.auth_token, signature, url, req.body)) {
+      return next();
+    }
+  }
+
+  console.warn(`[SECURITY] Invalid Twilio signature from ${req.ip} — rejected`);
+  return res.status(403).send('Forbidden');
 }
 
 // ── Webhook ───────────────────────────────────────────────────────────────────
@@ -1163,7 +1171,7 @@ app.post('/webhook', validateTwilioSignature, async (req, res) => {
   try {
     // Route by the receiving Twilio number so each business gets only its messages.
     const { data: twilioSettings, error } = await supabase
-      .from('twilio_settings').select('business_id')
+      .from('twilio_settings').select('business_id, account_sid, auth_token, whatsapp_from')
       .eq('whatsapp_from', To)
       .eq('is_active', true)
       .maybeSingle();
@@ -1174,6 +1182,13 @@ app.post('/webhook', validateTwilioSignature, async (req, res) => {
       return;
     }
 
+    // Build a per-business Twilio client if the business has its own credentials;
+    // otherwise fall back to the platform client.
+    const bizClient = (twilioSettings.account_sid && twilioSettings.auth_token)
+      ? twilio(twilioSettings.account_sid, twilioSettings.auth_token)
+      : twilioClient;
+    const bizFrom = twilioSettings.whatsapp_from || process.env.TWILIO_WHATSAPP_FROM;
+
     // Serializado por teléfono: el ciclo leer-sesión → procesar → guardar →
     // responder corre en serie para este número (evita carreras y citas dobles).
     await withPhoneLock(phone, async () => {
@@ -1183,7 +1198,7 @@ app.post('/webhook', validateTwilioSignature, async (req, res) => {
       // por (business_id, phone) — usar la MISMA clave para guardar (FIX 3).
       const key = sessKey(phone, bId);
       if (sessions[key]) await saveSession(phone, sessions[key], bId);
-      await sendWhatsApp(phone, reply);
+      await sendWhatsApp(phone, reply, bizClient, bizFrom);
       // Medición de uso: 1 entrante procesado + 1 respuesta enviada
       await bumpUsage(bId, 'inbound', 1);
       await bumpUsage(bId, 'outbound', 1);
