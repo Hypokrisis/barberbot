@@ -378,10 +378,11 @@ async function getAllActiveAppointments(phone, businessId) {
     .select('id, customer_name, appointment_date, start_time, barber_id, service_id')
     .eq('business_id', businessId)
     .eq('customer_phone', phone)
-    .eq('status', 'confirmed')
-    .gte('appointment_date', todayStr)
+    .eq('status', 'confirmed')       // FIX D: excludes completed, cancelled, no_show
+    .gte('appointment_date', todayStr) // FIX D: excludes past dates
     .order('appointment_date', { ascending: true });
   const nowTime = nowTimePR();
+  // FIX D: also exclude same-day past slots (in-memory, avoids 1-min DB precision issues)
   return (data || []).filter(a =>
     a.appointment_date > todayStr ||
     a.start_time.slice(0, 5) >= nowTime
