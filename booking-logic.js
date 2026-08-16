@@ -50,14 +50,20 @@ function formatTime(timeStr) {
   return `${hour}:${String(m).padStart(2, '0')} ${period}`;
 }
 
-// "Hoy" / "Mañana" / "Miércoles" para el mensaje de disponibilidad
+// "Hoy — Domingo 16 de agosto" / "Mañana — Lunes 17 de agosto" / "Miércoles 19 de agosto"
+const MONTHS_ES = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
+const DAYS_ES   = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
 function displayDay(dateStr) {
+  const dt  = new Date(dateStr + 'T12:00:00');
+  const day = DAYS_ES[dt.getDay()];
+  const num = dt.getDate();
+  const mon = MONTHS_ES[dt.getMonth()];
+  const full = `${day} ${num} de ${mon}`;
   const t = todayPR();
-  if (dateStr === t) return 'Hoy';
+  if (dateStr === t) return `Hoy — ${full}`;
   const tm = new Date(t + 'T12:00:00'); tm.setDate(tm.getDate() + 1);
-  if (dateStr === tm.toISOString().split('T')[0]) return 'Mañana';
-  const days = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
-  return days[new Date(dateStr + 'T12:00:00').getDay()];
+  if (dateStr === tm.toISOString().split('T')[0]) return `Mañana — ${full}`;
+  return full;
 }
 
 // ¿La terna y-m-d corresponde a una fecha real del calendario? (sin rollover)
@@ -237,7 +243,7 @@ async function respond({ session, msg, understood, ctx, deps }) {
     return bookingLink;
   }
   function resetData() {
-    d.bk = null; d.offered = null; d.negotiation = 0;
+    d.bk = null; d.offered = null; d.hiddenSlots = null; d.negotiation = 0;
     d.pendingAction = null; d.reschedule = null; d.cancelApptId = null;
   }
   function setService(bk, s) { bk.serviceId = s.id; bk.serviceName = s.name; bk.servicePrice = s.price; bk.serviceDuration = s.duration_minutes || 30; }
@@ -300,28 +306,79 @@ async function respond({ session, msg, understood, ctx, deps }) {
     return !!(understood.date && !resolveHoyMañana(understood.date));
   }
 
+  const SLOTS_PREVIEW = 6; // horarios visibles antes de "tengo más"
+
   // Muestra los horarios REALES de los días dados (hoy y/o mañana), numerados de
-  // corrido. Hoy filtra las horas ya pasadas. Sin cupos en ningún día → link.
+  // corrido. Limita a SLOTS_PREVIEW; el resto queda en d.hiddenSlots.
   async function offerDays(days, forReschedule, lead) {
     const bk = d.bk;
     if (!bk || !bk.barberId) return out(`Para ver horarios dime con qué barbero 🙂`, 'collecting');
     const tStr = todayPR();
     const nm = nowMinPR();
-    d.offered = [];
-    const blocks = [];
-    let n = 0;
+    const allSlots = []; // { date, time } en orden
     for (const day of days) {
       const av = await deps.getDayAvailability(bk.barberId, day);
       let slots = (av && av.available) || [];
       if (day === tStr) slots = slots.filter(s => toMin(s) > nm + 15);
-      if (!slots.length) continue;
-      const lines = slots.map(s => { d.offered.push({ date: day, time: s }); return `${++n}. ${formatTime(s)}`; });
-      blocks.push(`*${displayDay(day).toUpperCase()}*\n${lines.join('\n')}`);
+      slots.forEach(s => allSlots.push({ date: day, time: s }));
     }
-    if (!d.offered.length) return linkEnd();
-    const head = lead ? `${lead}\n\n` : '';
+    if (!allSlots.length) return linkEnd();
+
+    const visible = allSlots.slice(0, SLOTS_PREVIEW);
+    const hidden  = allSlots.slice(SLOTS_PREVIEW);
+    d.offered     = visible;
+    d.hiddenSlots = hidden;
+
+    // Agrupar visibles por día para mostrar cabecera de fecha
+    const blocks = [];
+    let n = 0;
+    let lastDay = null;
+    const lines = [];
+    for (const s of visible) {
+      if (s.date !== lastDay) {
+        if (lines.length) blocks.push(lines.join('\n'));
+        lines.length = 0;
+        lastDay = s.date;
+        lines.push(`*${displayDay(s.date).toUpperCase()}*`);
+      }
+      lines.push(`${++n}. ${formatTime(s.time)}`);
+    }
+    if (lines.length) blocks.push(lines.join('\n'));
+
+    const head   = lead ? `${lead}\n\n` : '';
+    const footer = hidden.length ? `\n\nTengo más horarios disponibles si lo deseas 😊` : '';
     return out(
-      `${head}📅 *${bk.barberName}* — elige tu horario:\n${blocks.join('\n\n')}\n\n(responde el número o la hora)`,
+      `${head}📅 *${bk.barberName}* — elige tu horario:\n${blocks.join('\n\n')}${footer}\n\n(responde el número o la hora)`,
+      forReschedule ? 'rescheduling' : 'picking_slot'
+    );
+  }
+
+  // Muestra los horarios ocultos cuando el cliente los pide.
+  async function offerMoreSlots(forReschedule) {
+    const hidden = d.hiddenSlots || [];
+    if (!hidden.length) return out(`Ya te mostré todos los horarios disponibles 😊`, forReschedule ? 'rescheduling' : 'picking_slot');
+    const startN = (d.offered || []).length + 1;
+    const newVisible = hidden.slice(0, SLOTS_PREVIEW);
+    const stillHidden = hidden.slice(SLOTS_PREVIEW);
+    d.offered     = (d.offered || []).concat(newVisible);
+    d.hiddenSlots = stillHidden;
+    let n = startN - 1;
+    const blocks = [];
+    let lastDay = null;
+    const lines = [];
+    for (const s of newVisible) {
+      if (s.date !== lastDay) {
+        if (lines.length) blocks.push(lines.join('\n'));
+        lines.length = 0;
+        lastDay = s.date;
+        lines.push(`*${displayDay(s.date).toUpperCase()}*`);
+      }
+      lines.push(`${++n}. ${formatTime(s.time)}`);
+    }
+    if (lines.length) blocks.push(lines.join('\n'));
+    const footer = stillHidden.length ? `\n\nAún tengo más, solo dime 😊` : `\n\n(Esos son todos los disponibles)`;
+    return out(
+      `Claro, aquí tienes más:\n${blocks.join('\n\n')}${footer}\n\n(responde el número o la hora)`,
       forReschedule ? 'rescheduling' : 'picking_slot'
     );
   }
@@ -364,6 +421,12 @@ async function respond({ session, msg, understood, ctx, deps }) {
     return linkEnd();
   }
 
+  // Detecta si el cliente pide más horarios ("más", "sí", "quiero más horarios", etc.)
+  function wantsMoreSlots() {
+    const t = String(msg).trim().toLowerCase();
+    return /\bm[aá]s\b/.test(t) || /\bm[aá]s horarios\b/.test(t) || /^s[íi]$/.test(t) || /quiero m[aá]s/.test(t);
+  }
+
   // Interpreta la elección de horario (picking_slot y rescheduling). Solo hoy/mañana:
   // número de la lista, hora mostrada, o "hoy"/"mañana". Otra fecha u hora fuera de
   // la lista → link y fin. Nada que reconocer → re-muestra hoy y mañana.
@@ -371,6 +434,8 @@ async function respond({ session, msg, understood, ctx, deps }) {
     const offered = d.offered || [];
     // Otra fecha (no hoy/mañana) → link y fin.
     if (otherDateMentioned()) return linkEnd();
+    // Pide más horarios.
+    if (wantsMoreSlots() && (d.hiddenSlots || []).length) return await offerMoreSlots(forReschedule);
     // 1. Elección por número de la lista mostrada.
     if (choiceNum && choiceNum >= 1 && choiceNum <= offered.length) {
       const sel = offered[choiceNum - 1];
