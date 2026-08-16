@@ -600,7 +600,20 @@ async function respond({ session, msg, understood, ctx, deps }) {
     if (action === 'reschedule_start') affirm = affirm || I === 'REAGENDAR';
 
     if (affirm) {
-      if (action === 'reschedule_start') return await offerDays([todayPR(), tomorrowStr()], true); // → horarios hoy/mañana
+      if (action === 'reschedule_start') {
+        // "Sí a las 3pm" — afirmó Y dio hora: confirmar directamente sin pedir día
+        if (understood.time) {
+          const t = normalizeTime(understood.time);
+          const dateHint = understood.date ? resolveHoyMañana(understood.date) : null;
+          if (dateHint) return await confirmSlot(dateHint, t, true);
+          // Sin día: probar hoy primero, luego mañana
+          const today = todayPR();
+          const chkToday = await deps.checkSlot(d.bk.barberId, today, t);
+          if (chkToday.status === 'available') return await confirmSlot(today, t, true);
+          return await confirmSlot(tomorrowStr(), t, true);
+        }
+        return await offerDays([todayPR(), tomorrowStr()], true); // → horarios hoy/mañana
+      }
       if (action === 'create') {
         const bk = d.bk;
         // FIX 4 — REGLA #1 defendida en el chokepoint: si apareció una cita activa
