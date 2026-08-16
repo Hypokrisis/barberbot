@@ -165,18 +165,32 @@ function canSendProactive(business) {
   return getPlan(business) === 'premium';
 }
 
+// ── Business info cache (5 min TTL) — elimina 4 DB queries en mensajes repetidos ─
+const _bizCache = {};
+const BIZ_CACHE_TTL = 5 * 60 * 1000;
+function invalidateBusinessCache(businessId) { delete _bizCache[businessId]; }
+
+// ── Twilio settings cache (2 min TTL) — evita doble query por mensaje ────────
+const _twilioCache = {};
+const TWILIO_CACHE_TTL = 2 * 60 * 1000;
+
 // ── Supabase helpers ──────────────────────────────────────────────────────────
 async function getBusinessInfo(businessId) {
-  const { data: business } = await supabase
-    .from('businesses').select('*').eq('id', businessId).single();
-  const { data: allBarbers } = await supabase
-    .from('barbers').select('id,name,phone_e164')
-    .eq('business_id', businessId).eq('is_active', true);
-  const { data: services } = await supabase
-    .from('services').select('id,name,duration_minutes,price')
-    .eq('business_id', businessId).eq('is_active', true);
+  const now = Date.now();
+  if (_bizCache[businessId] && now - _bizCache[businessId].ts < BIZ_CACHE_TTL) {
+    return _bizCache[businessId].data;
+  }
 
-  // Solo barberos RESERVABLES: activos Y con al menos un horario activo (FALLO 4)
+  // Ronda 1: businesses + barbers + services en paralelo (3 queries → 1 ronda)
+  const [{ data: business }, { data: allBarbers }, { data: services }] = await Promise.all([
+    supabase.from('businesses').select('*').eq('id', businessId).single(),
+    supabase.from('barbers').select('id,name,phone_e164')
+      .eq('business_id', businessId).eq('is_active', true),
+    supabase.from('services').select('id,name,duration_minutes,price')
+      .eq('business_id', businessId).eq('is_active', true),
+  ]);
+
+  // Ronda 2: schedules (necesita los IDs de barberos de ronda 1)
   const ids = (allBarbers || []).map(b => b.id);
   let barbers = allBarbers || [];
   if (ids.length) {
@@ -184,9 +198,12 @@ async function getBusinessInfo(businessId) {
       .from('schedules').select('barber_id').eq('is_active', true).in('barber_id', ids);
     const withSched = new Set((scheds || []).map(s => s.barber_id));
     const bookable = barbers.filter(b => withSched.has(b.id));
-    if (bookable.length) barbers = bookable; // si ninguno tiene horario, no rompas el flujo
+    if (bookable.length) barbers = bookable;
   }
-  return { business, barbers, services };
+
+  const result = { business, barbers, services };
+  _bizCache[businessId] = { data: result, ts: now };
+  return result;
 }
 
 // Próxima disponibilidad real de un barbero: hasta `maxDays` días con cupos,
@@ -1134,13 +1151,20 @@ async function validateTwilioSignature(req, res, next) {
   // Try per-business auth token for businesses with their own Twilio sub-account
   const To = req.body?.To;
   if (To) {
-    const { data: ts } = await supabase
-      .from('twilio_settings')
-      .select('auth_token')
-      .eq('whatsapp_from', To)
-      .eq('is_active', true)
-      .maybeSingle();
+    const cached = _twilioCache[To];
+    let ts = cached && Date.now() - cached.ts < TWILIO_CACHE_TTL ? cached.data : null;
+    if (!ts) {
+      const { data } = await supabase
+        .from('twilio_settings')
+        .select('business_id,account_sid,auth_token,whatsapp_from')
+        .eq('whatsapp_from', To)
+        .eq('is_active', true)
+        .maybeSingle();
+      ts = data;
+      if (ts) _twilioCache[To] = { data: ts, ts: Date.now() };
+    }
     if (ts?.auth_token && twilio.validateRequest(ts.auth_token, signature, url, req.body)) {
+      req._cachedTwilioSettings = ts; // reutilizar en el webhook, evita segunda query
       return next();
     }
   }
@@ -1169,12 +1193,20 @@ app.post('/webhook', validateTwilioSignature, async (req, res) => {
   console.log(`[${phone}] ${Body}`);
 
   try {
-    // Route by the receiving Twilio number so each business gets only its messages.
-    const { data: twilioSettings, error } = await supabase
-      .from('twilio_settings').select('business_id, account_sid, auth_token, whatsapp_from')
-      .eq('whatsapp_from', To)
-      .eq('is_active', true)
-      .maybeSingle();
+    // Route by the receiving Twilio number — reutiliza el cache calentado en validateTwilioSignature
+    const cached = req._cachedTwilioSettings || _twilioCache[To]?.data;
+    let twilioSettings = cached && (!_twilioCache[To] || Date.now() - _twilioCache[To].ts < TWILIO_CACHE_TTL) ? cached : null;
+    let error = null;
+    if (!twilioSettings) {
+      const res2 = await supabase
+        .from('twilio_settings').select('business_id, account_sid, auth_token, whatsapp_from')
+        .eq('whatsapp_from', To)
+        .eq('is_active', true)
+        .maybeSingle();
+      twilioSettings = res2.data;
+      error = res2.error;
+      if (twilioSettings) _twilioCache[To] = { data: twilioSettings, ts: Date.now() };
+    }
 
     if (error || !twilioSettings) {
       console.warn(`[routing] No active twilio_settings for To=${To}`);
@@ -1194,14 +1226,17 @@ app.post('/webhook', validateTwilioSignature, async (req, res) => {
     await withPhoneLock(phone, async () => {
       const bId = twilioSettings.business_id;
       const reply = await handleMessage(phone, Body, bId);
-      // Persist session after every message (write-through). La sesión se llave
-      // por (business_id, phone) — usar la MISMA clave para guardar (FIX 3).
+
+      // saveSession + sendWhatsApp en paralelo (no se bloquean entre sí)
       const key = sessKey(phone, bId);
-      if (sessions[key]) await saveSession(phone, sessions[key], bId);
-      await sendWhatsApp(phone, reply, bizClient, bizFrom);
-      // Medición de uso: 1 entrante procesado + 1 respuesta enviada
-      await bumpUsage(bId, 'inbound', 1);
-      await bumpUsage(bId, 'outbound', 1);
+      await Promise.all([
+        sessions[key] ? saveSession(phone, sessions[key], bId) : Promise.resolve(),
+        sendWhatsApp(phone, reply, bizClient, bizFrom),
+      ]);
+
+      // bumpUsage fire-and-forget: métrica no-crítica, no bloquea la respuesta
+      bumpUsage(bId, 'inbound', 1);
+      bumpUsage(bId, 'outbound', 1);
     });
   } catch (err) {
     console.error('Webhook error:', err);
