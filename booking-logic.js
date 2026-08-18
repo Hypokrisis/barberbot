@@ -513,8 +513,10 @@ async function respond({ session, msg, understood, ctx, deps }) {
       if (s) setService(bk, s);
     }
 
-    // Barber: el nombre del barbero aparece como palabra entera o prefijo (≥3 letras)
-    if (!bk.barberId && barbers.length > 1) {
+    // Barber: solo escanea si nombre+servicio ya están seteados (mismo gate que
+    // recoverSingleWord). Esto previene el falso positivo donde el nombre del cliente
+    // coincide con el nombre de un barbero ("soy Loann Javier" → no setear barber=Loann).
+    if (!bk.barberId && barbers.length > 1 && bk.name && bk.serviceId) {
       const b = barbers.find(ba => {
         const bn = ba.name.toLowerCase().trim().replace(/[^\p{L}\p{N}]/gu, '');
         if (bn.length < 3) return false;
@@ -778,7 +780,14 @@ async function respond({ session, msg, understood, ctx, deps }) {
     // CASO B ya incluye los servicios con precios, así que también responde la
     // pregunta informativa del cliente conocido.
     if (history && history.hasHistory) {
-      if (hasData) { mergeUnderstood(); return await advanceCollecting(); }
+      // Pre-fill bk.name from history so recoverFromRawMessage has context when
+      // Groq returns all-null (e.g. "quiero el corte moderno con Pacheco" Groq null).
+      const d2 = session.data;
+      const bk2 = d2.bk || (d2.bk = {});
+      if (history.name && !bk2.name) bk2.name = titleCase(history.name);
+      if (!hasData) recoverFromRawMessage(bk2);
+      const hasRaw = !!(bk2.serviceId || bk2.barberId);
+      if (hasData || hasRaw) { if (hasData) mergeUnderstood(); return await advanceCollecting(); }
       return out(recurringText(), 'collecting', { reminder: false });
     }
 
