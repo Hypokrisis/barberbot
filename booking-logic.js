@@ -496,6 +496,34 @@ async function respond({ session, msg, understood, ctx, deps }) {
     }
   }
 
+  // Fallback determinista para mensajes multi-palabra: si Groq no extrajo
+  // servicio o barbero, escanea el mensaje crudo buscando nombres exactos
+  // (case-insensitive). En estado collecting, texto que coincide con un barbero
+  // activo SE TRATA COMO BARBERO, no como nombre del cliente.
+  function recoverFromRawMessage(bk) {
+    const text = msg.toLowerCase();
+    const msgWords = text.split(/\s+/).map(w => w.replace(/[^\p{L}\p{N}]/gu, ''));
+
+    // Service: el nombre del servicio (puede ser multi-palabra) aparece en el mensaje
+    if (!bk.serviceId) {
+      const s = services.find(sv => {
+        const sn = sv.name.toLowerCase();
+        return sn.length >= 3 && text.includes(sn);
+      });
+      if (s) setService(bk, s);
+    }
+
+    // Barber: el nombre del barbero aparece como palabra entera o prefijo (≥3 letras)
+    if (!bk.barberId && barbers.length > 1) {
+      const b = barbers.find(ba => {
+        const bn = ba.name.toLowerCase().trim().replace(/[^\p{L}\p{N}]/gu, '');
+        if (bn.length < 3) return false;
+        return msgWords.some(w => w === bn || w.startsWith(bn) || bn.startsWith(w));
+      });
+      if (b) setBarber(bk, b);
+    }
+  }
+
   // Pide lo que falte (nombre/servicio/barbero) o pasa a ofrecer horarios hoy/mañana.
   async function advanceCollecting() {
     // PASO 2: si mencionó una fecha que no es hoy/mañana → link y fin (aunque falten datos).
@@ -504,6 +532,7 @@ async function respond({ session, msg, understood, ctx, deps }) {
     const bk = d.bk || (d.bk = {});
     if (!bk.barberId && barbers.length === 1) setBarber(bk, barbers[0]);
     recoverSingleWord(bk);
+    recoverFromRawMessage(bk);
 
     const missing = [];
     if (!bk.name) missing.push('tu nombre');

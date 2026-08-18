@@ -448,7 +448,7 @@ async function understand(message, services, barbers, state, offeredCtx, hoursCt
   const bar = barbers.map(b => b.name).join(', ');
   const inFlow = ['collecting', 'picking_slot', 'confirming', 'rescheduling'].includes(state);
   const hint = ({
-    collecting:   'El bot está juntando nombre, servicio y barbero. Si una palabra suelta coincide con un barbero de la lista, ponla en "barber"; si coincide con un servicio, en "service"; si no coincide con ninguno, es el nombre del cliente ("name").',
+    collecting:   `El bot está juntando nombre, servicio y barbero. Analiza TODO el mensaje (no solo palabras sueltas): si hay texto que coincide con algún barbero de la lista (exacto, prefijo, o "con X"), ponlo en "barber"; si hay texto que coincide con algún servicio de la lista, ponlo en "service". El resto que no sea barbero ni servicio es el nombre del cliente ("name"). Ejemplos: "corte moderno pacheco" → service="Corte moderno", barber="Pacheco", name=null. "quiero el corte moderno con pacheco" → service="Corte moderno", barber="Pacheco".`,
     picking_slot: 'El bot ofreció horarios. Un número, una hora o una posición ("el primero") es la elección (intent NUEVA_CITA).',
     rescheduling: 'El bot ofreció horarios para reagendar. Un número, una hora o una posición ("el primero") es la elección.',
     confirming:   'El bot pidió confirmar (sí/no). "sí/dale/ok/eso/va/perfecto"=CONFIRMAR, "no/mejor no/nah/qué va"=NEGAR.',
