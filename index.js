@@ -517,7 +517,12 @@ No inventes datos que no estén en el mensaje.`;
     j.ampm_ambiguous = j.ampm_ambiguous === true;
     return j;
   } catch (e) {
-    console.error('[understand] failed:', e.message);
+    const msg = e.message || '';
+    if (msg.includes('404') || msg.includes('model_not_found') || msg.includes('does not exist')) {
+      console.error(`🚨 GROQ MODEL DEPRECATED — the model no longer exists. Update the model name in index.js immediately. Error: ${msg}`);
+    } else {
+      console.error('[understand] failed:', msg);
+    }
     return { intent: 'UNKNOWN' };
   }
 }
