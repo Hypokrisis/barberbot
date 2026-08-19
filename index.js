@@ -504,7 +504,7 @@ No inventes datos que no estén en el mensaje.`;
 
   try {
     const c = await groq.chat.completions.create({
-      model: 'llama-3.1-8b-instant',
+      model: 'llama-3.3-70b-versatile',
       messages: [{ role: 'system', content: sys }, { role: 'user', content: message }],
       temperature: 0,
       max_tokens: 200,
@@ -549,7 +549,7 @@ REGLAS ESTRICTAS:
 
   session.history.push({ role: 'user', content: message });
   const completion = await groq.chat.completions.create({
-    model: 'llama-3.1-8b-instant',
+    model: 'llama-3.3-70b-versatile',
     messages: [{ role: 'system', content: systemPrompt }, ...session.history.slice(-4)],
     temperature: 0.2,
     max_tokens: 100

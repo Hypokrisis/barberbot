@@ -625,8 +625,13 @@ async function respond({ session, msg, understood, ctx, deps }) {
   //    malinterpreten como intención global.
   if (session.state === 'confirming') {
     const action = d.pendingAction;
-    let affirm = I === 'CONFIRMAR' || rawNum === 1;
-    let negate = I === 'NEGAR' || rawNum === 2;
+    // Deterministic sí/no — never relies on Groq (which may be unavailable).
+    // These patterns cover the confirming state without NLU so the bot never
+    // loops when the LLM returns UNKNOWN due to a model outage or rate limit.
+    const CONFIRM_RX = /^(s[íi]|si|yes|dale|ok|eso|va|perfecto|claro|bueno|adelante|confirmo|yep|sip)\b/iu;
+    const NEGATE_RX  = /^(no\b|nah|mejor no|que va|qué va|nop|olvídalo|olvidalo)/iu;
+    let affirm = I === 'CONFIRMAR' || rawNum === 1 || CONFIRM_RX.test(msg.trim());
+    let negate  = I === 'NEGAR'    || rawNum === 2 || NEGATE_RX.test(msg.trim());
     if (action === 'cancel') affirm = affirm || I === 'CANCELAR';
     if (action === 'reschedule_start') affirm = affirm || I === 'REAGENDAR';
 
