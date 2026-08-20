@@ -203,10 +203,29 @@ const OPTIONS_REMINDER = '💬 Cualquier momento puedes decir: *cita* · *reagen
 //   deps      — { getSlots, getUpcoming, getActiveAppointments,
 //                 commitCreate, commitReschedule, commitCancel, askGeneral }
 //
+// Capa determinista sobre el mensaje CRUDO para los intents críticos del menú
+// propio del bot (reagendar/cancelar). Corre ANTES que Groq y lo pisa si matchea:
+// las palabras que el bot mismo ofrece en su menú NUNCA pueden fallar por una
+// mala clasificación del LLM (ej. Groq devolviendo CONFIRMAR/UNKNOWN para
+// "quiero reagendar" o el literal "reagendar" — visto en producción).
+const REAGENDAR_RX = /reagend|cambiar\s*(mi\s*)?cita|mover\s*(mi\s*)?cita/iu;
+const CANCELAR_RX  = /cancel/iu;
+// "no cancelo mi cita" / "no, mejor no la cambies" contienen las palabras clave
+// pero son una NEGACIÓN, no la intención. Mismo prefijo que NEGATE_RX de abajo:
+// si el mensaje empieza negando, la capa determinista no debe pisar a Groq.
+const NEGATION_PREFIX_RX = /^(no\b|nah|mejor no|que va|qué va|nop|olvídalo|olvidalo)/iu;
+function deterministicIntent(msg) {
+  const t = String(msg || '').trim();
+  if (NEGATION_PREFIX_RX.test(t)) return null;
+  if (REAGENDAR_RX.test(t)) return 'REAGENDAR';
+  if (CANCELAR_RX.test(t))  return 'CANCELAR';
+  return null;
+}
+
 async function respond({ session, msg, understood, ctx, deps }) {
   const { services, barbers, bookingLink, history } = ctx;
   const d = session.data || (session.data = {});
-  const I = (understood && understood.intent) || 'UNKNOWN';
+  const I = deterministicIntent(msg) || (understood && understood.intent) || 'UNKNOWN';
   const rawNum = /^\d+$/.test(msg.trim()) ? parseInt(msg.trim(), 10) : null;            // "1", "2"
   // Punto 3: si Groq devolvió una hora explícita, NUNCA la tratamos como "choice"
   // por índice. La hora manda y se verifica contra la DB.
@@ -245,6 +264,7 @@ async function respond({ session, msg, understood, ctx, deps }) {
   function resetData() {
     d.bk = null; d.offered = null; d.hiddenSlots = null; d.negotiation = 0;
     d.pendingAction = null; d.reschedule = null; d.cancelApptId = null;
+    d.awaitingReagendarCancelar = null;
   }
   function setService(bk, s) { bk.serviceId = s.id; bk.serviceName = s.name; bk.servicePrice = s.price; bk.serviceDuration = s.duration_minutes || 30; }
   function setBarber(bk, b) { bk.barberId = b.id; bk.barberName = b.name; }
@@ -776,6 +796,16 @@ async function respond({ session, msg, understood, ctx, deps }) {
     // capturados como intents globales arriba) → SIEMPRE muestra la cita y pregunta
     // reagendar/cancelar. Sin nueva cita, sin preguntas generales, sin otras ramas.
     if (active) {
+      // Si ya se ofreció reagendar/cancelar y el cliente responde con un "sí"
+      // pelado (sin decir cuál de las dos), NO repetir el menú completo — Groq
+      // pudo clasificarlo como CONFIRMAR (no hay pendingAction en idle que lo
+      // consuma) y sin este atajo el bot lo respondía con el mismo bloque de
+      // nuevo, en loop, hasta que el cliente escribiera la palabra exacta.
+      const BARE_AFFIRM_RX = /^(s[íi]|si|ok|dale|confirmo)\b/iu;
+      if (d.awaitingReagendarCancelar && BARE_AFFIRM_RX.test(String(msg).trim())) {
+        return out(`¿Reagendar o cancelar? 😊`, undefined, { reminder: false });
+      }
+      d.awaitingReagendarCancelar = true;
       return out(activeApptText(active), undefined, { reminder: false });
     }
 
