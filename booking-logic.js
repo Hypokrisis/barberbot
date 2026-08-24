@@ -694,7 +694,13 @@ async function respond({ session, msg, understood, ctx, deps }) {
         const { name, date, time } = bk;
         resetData();
         if (!r.ok) return out(`Uy, no pude guardar la cita 😕 Intenta de nuevo en un momento.`, 'idle');
-        return out(`✅ ¡Listo, ${name}! Te esperamos el ${formatDate(date)} a las ${formatTime(time)} 💈\n\nSi necesitas algo: 🔄 Reagendar · ❌ Cancelar\n\n📋 Crea tu cuenta para ver y gestionar tus citas: ${FRONTEND_URL}/register-client`, 'idle');
+        // Con claim token, el registro salta la verificación SMS (el número ya
+        // se probó al llegar por WhatsApp). Sin token (cliente ya registrado u
+        // otro caso), cae al link genérico de siempre.
+        const registerLink = r.claimToken
+          ? `${FRONTEND_URL}/register-client?claim=${r.claimToken}`
+          : `${FRONTEND_URL}/register-client`;
+        return out(`✅ ¡Listo, ${name}! Te esperamos el ${formatDate(date)} a las ${formatTime(time)} 💈\n\nSi necesitas algo: 🔄 Reagendar · ❌ Cancelar\n\n📋 Crea tu cuenta para ver y gestionar tus citas: ${registerLink}`, 'idle');
       }
       if (action === 'reschedule') {
         const bk = d.bk;

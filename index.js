@@ -342,6 +342,23 @@ async function findRegisteredUser(phone) {
   return profiles.find(p => normalizePhone(p.phone || '').slice(-10) === normalized.slice(-10)) || null;
 }
 
+// Claim token: prueba que el cliente es dueño del número (llegó por WhatsApp),
+// así el registro en el frontend puede saltar el paso de verificación SMS y
+// vincular sus citas automáticamente. Ver 20260819120000_client_claim_tokens.sql.
+async function createClaimToken(phone, businessId, appointmentId) {
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+  const { data, error } = await supabase
+    .from('client_claim_tokens')
+    .insert({ phone, business_id: businessId, appointment_id: appointmentId, expires_at: expiresAt })
+    .select('token')
+    .single();
+  if (error) {
+    console.error('[createClaimToken]', error.code, error.message);
+    return undefined;
+  }
+  return data.token;
+}
+
 async function createAppointment(data) {
   // Intentar linkear con usuario registrado por teléfono
   const registeredUser = await findRegisteredUser(data.customerPhone);
@@ -1015,7 +1032,7 @@ async function handleMessage(phone, message, businessId) {
       getUpcoming,
       getActiveAppointments: () => getAllActiveAppointments(phone, businessId),
       commitCreate: async (bk) => {
-        const { appt, error } = await createAppointment({
+        const { appt, error, isGuest } = await createAppointment({
           businessId, barberId: bk.barberId, serviceId: bk.serviceId,
           customerName: bk.name, customerPhone: phone,
           date: bk.date, startTime: bk.startTime, endTime: bk.endTime,
@@ -1030,7 +1047,12 @@ async function handleMessage(phone, message, businessId) {
           return { ok: false };
         }
         await suppressBotTemplate(appt.id, 'created'); // el bot ya confirmó aquí
-        return { ok: true };
+        // Solo clientes sin cuenta necesitan el claim token — un fallo aquí no
+        // debe tumbar la confirmación de la cita, solo se pierde el link con token.
+        const claimToken = isGuest
+          ? await createClaimToken(normalizePhoneE164(phone), businessId, appt.id)
+          : undefined;
+        return { ok: true, claimToken };
       },
       commitReschedule: async (apptId, date, time, endTime) => {
         const { error } = await supabase.from('appointments')
