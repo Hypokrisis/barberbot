@@ -248,7 +248,7 @@ async function getDayAvailability(barberId, date) {
 
   const { data: appointments } = await supabase
     .from('appointments').select('start_time,end_time')
-    .eq('barber_id', barberId).eq('appointment_date', date).neq('status', 'cancelled');
+    .eq('barber_id', barberId).eq('appointment_date', date).eq('status', 'confirmed');
 
   const open = schedule.start_time.slice(0, 5);
   const close = schedule.end_time.slice(0, 5);
