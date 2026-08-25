@@ -107,6 +107,37 @@ function normalizeTime(t) {
   return `${String(h).padStart(2, '0')}:${m[2]}`;
 }
 
+// Fallback determinista: extrae una hora del texto crudo cuando Groq no la devuelve.
+// Produce HH:MM en 24h, igual que normalizeTime espera. Tres patrones en orden de
+// precisión: (1) hora con am/pm explícito, (2) "las X / a las X", (3) HH:MM suelto.
+// Heurística para "las X" sin meridiem: 1-7 → PM (13-19), 8-12 → AM — coincide
+// con horario típico de barbería y evita que "las 3" resuelva a las 03:00.
+function extractRawTime(text) {
+  const s = String(text);
+  const explicit = s.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)\b/iu);
+  if (explicit) {
+    let h = parseInt(explicit[1], 10);
+    const min = explicit[2] || '00';
+    const mer = explicit[3].replace(/\./g, '').toLowerCase();
+    if (mer === 'pm' && h < 12) h += 12;
+    if (mer === 'am' && h === 12) h = 0;
+    return `${String(h).padStart(2, '0')}:${min}`;
+  }
+  const las = s.match(/(?:a\s+)?las?\s+(\d{1,2})(?::(\d{2}))?/iu);
+  if (las) {
+    let h = parseInt(las[1], 10);
+    const min = las[2] || '00';
+    if (h >= 1 && h <= 7) h += 12;
+    return `${String(h).padStart(2, '0')}:${min}`;
+  }
+  const bare = s.match(/\b(\d{1,2}):(\d{2})\b/);
+  if (bare) {
+    const h = parseInt(bare[1], 10);
+    if (h >= 0 && h <= 23) return `${String(h).padStart(2, '0')}:${bare[2]}`;
+  }
+  return null;
+}
+
 const toMin = (t) => { const [h, m] = t.split(':').map(Number); return h * 60 + m; };
 function addDuration(time, dur) {
   const e = toMin(time) + (dur || 30);
@@ -226,7 +257,8 @@ async function respond({ session, msg, understood, ctx, deps }) {
   const { services, barbers, bookingLink, history } = ctx;
   const d = session.data || (session.data = {});
   const I = deterministicIntent(msg) || (understood && understood.intent) || 'UNKNOWN';
-  const rawNum = /^\d+$/.test(msg.trim()) ? parseInt(msg.trim(), 10) : null;            // "1", "2"
+  const rawNum  = /^\d+$/.test(msg.trim()) ? parseInt(msg.trim(), 10) : null;           // "1", "2"
+  const rawTime = rawNum === null ? extractRawTime(msg) : null;                          // "3pm", "las 3", "15:30"
   // Punto 3: si Groq devolvió una hora explícita, NUNCA la tratamos como "choice"
   // por índice. La hora manda y se verifica contra la DB.
   const choiceNum = rawNum || (understood.time ? null : (Number.isInteger(understood.choice) ? understood.choice : null));
@@ -464,12 +496,14 @@ async function respond({ session, msg, understood, ctx, deps }) {
     // 2. Día hoy/mañana mencionado.
     if (understood.date) {
       const rd = resolveHoyMañana(understood.date); // hoy o mañana (otherDate ya filtró)
-      if (understood.time) return await confirmSlot(rd, normalizeTime(understood.time), forReschedule);
+      const timeHint = understood.time || rawTime;  // rawTime: fallback si Groq no extrajo la hora
+      if (timeHint) return await confirmSlot(rd, normalizeTime(timeHint), forReschedule);
       return await offerDays([rd], forReschedule);
     }
     // 3. Hora exacta sin día → si está en lista, confirmar; si no, verificar en DB.
-    if (understood.time) {
-      const t = normalizeTime(understood.time);
+    //    rawTime actúa como fallback cuando Groq devuelve time=null (outage o UNKNOWN).
+    if (understood.time || rawTime) {
+      const t = normalizeTime(understood.time || rawTime);
       const match = offered.find(o => o.time === t);
       if (match) return await confirmSlot(match.date, match.time, forReschedule);
       // No está en la lista ofrecida → verificar en hoy y mañana contra la DB.
