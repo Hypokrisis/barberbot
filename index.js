@@ -1268,7 +1268,14 @@ app.post('/webhook', validateTwilioSignature, async (req, res) => {
     });
   } catch (err) {
     console.error('Webhook error:', err);
-    await sendWhatsApp(phone, 'Ocurrió un error. Intenta de nuevo.');
+    // Si el envío de recuperación también falla (ej. credenciales de Twilio
+    // inválidas de ESTE negocio), no debe tumbar el proceso — afectaría a
+    // todos los demás negocios en la misma instancia.
+    try {
+      await sendWhatsApp(phone, 'Ocurrió un error. Intenta de nuevo.');
+    } catch (sendErr) {
+      console.error('[webhook] no se pudo enviar el mensaje de error:', sendErr.message);
+    }
   }
 });
 
